@@ -1,0 +1,102 @@
+<mxfile host="app.diagrams.net" modified="2026-08-14T00:00:00.000Z" agent="Codex" version="24.7.17" type="device" compressed="false">
+  <diagram id="blueos-dynamic-linker-12-stage" name="BlueOS 12-stage pipeline">
+    <mxGraphModel dx="1680" dy="920" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1680" pageHeight="920" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="&lt;b&gt;动态加载与动态链接：统一十二阶段流水线&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=28;fontColor=#0F172A;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="1600" height="42" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="从未受信任 artifact 到可运行实例；阶段 0–8 可回滚，9 原子提交，10 开始产生不可自动回滚的业务副作用" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=14;fontColor=#475569;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="140" y="62" width="1400" height="34" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="prep-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EFF6FF;strokeColor=#93C5FD;strokeWidth=2;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="530" height="660" as="geometry"/>
+        </mxCell>
+        <mxCell id="link-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F3FF;strokeColor=#C4B5FD;strokeWidth=2;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="595" y="120" width="510" height="660" as="geometry"/>
+        </mxCell>
+        <mxCell id="life-bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#86EFAC;strokeWidth=2;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="120" width="510" height="660" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="prep-title" value="&lt;b&gt;A. 准备事务（0–4）&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;输入校验、布局和私有映像&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=18;fontColor=#1E3A8A;spacingLeft=8;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="64" y="138" width="470" height="52" as="geometry"/>
+        </mxCell>
+        <mxCell id="link-title" value="&lt;b&gt;B. 依赖与链接（5–8）&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;冻结可见性并完成所有写入&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=18;fontColor=#5B21B6;spacingLeft=8;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="619" y="138" width="450" height="52" as="geometry"/>
+        </mxCell>
+        <mxCell id="life-title" value="&lt;b&gt;C. 提交与生命周期（9–11）&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;原子可见、初始化、运行和回收&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=18;fontColor=#166534;spacingLeft=8;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1154" y="138" width="450" height="52" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="s0" value="&lt;b&gt;0. 准入&lt;/b&gt;&lt;br&gt;格式 · class · machine · ABI · 来源 · 配额&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;输出：ArtifactIdentity&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="72" y="204" width="466" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="s1" value="&lt;b&gt;1. 预扫描&lt;/b&gt;&lt;br&gt;phdr / shdr / dynamic 概要；checked arithmetic&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;输出：ImageLayout&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="72" y="306" width="466" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="s2" value="&lt;b&gt;2. reserve / allocate&lt;/b&gt;&lt;br&gt;定义 load bias；建立未发布 regions&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;此时其他线程不可见&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="72" y="408" width="466" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="s3" value="&lt;b&gt;3. copy / zero&lt;/b&gt;&lt;br&gt;复制 p_filesz；显式清零 BSS&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;不允许依赖 allocator 恰好返回零内存&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="72" y="510" width="466" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="s4" value="&lt;b&gt;4. runtime metadata&lt;/b&gt;&lt;br&gt;解析 dynsym / hash / reloc / init / fini&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;目标地址经 load bias 与 region 范围校验&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3B82F6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="72" y="612" width="466" height="96" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="s5" value="&lt;b&gt;5. 依赖发现&lt;/b&gt;&lt;br&gt;DT_NEEDED 闭包；FileIdentity / SONAME 去重&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;限制深度、数量、环策略和所有权边&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8B5CF6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="627" y="220" width="446" height="94" as="geometry"/>
+        </mxCell>
+        <mxCell id="s6" value="&lt;b&gt;6. symbol scope&lt;/b&gt;&lt;br&gt;应用链接域 / 系统链接域分离；weak 与 visibility&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;在 relocation 前冻结本次查找顺序&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8B5CF6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="627" y="344" width="446" height="94" as="geometry"/>
+        </mxCell>
+        <mxCell id="s7" value="&lt;b&gt;7. relocation&lt;/b&gt;&lt;br&gt;RELATIVE → data/GOT → PLT（NOW）&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;逐次校验目标范围、宽度、对齐和类型&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8B5CF6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="627" y="468" width="446" height="94" as="geometry"/>
+        </mxCell>
+        <mxCell id="s8" value="&lt;b&gt;8. seal&lt;/b&gt;&lt;br&gt;最终 R/W/X · RELRO · D-cache / I-cache 同步&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;所有写完成后才能 seal，任何代码执行前完成 cache sync&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#8B5CF6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="627" y="592" width="446" height="106" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="commit-line" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#EF4444;strokeColor=none;opacity=70;" vertex="1" parent="1">
+          <mxGeometry x="1116" y="144" width="3" height="612" as="geometry"/>
+        </mxCell>
+        <mxCell id="commit-label" value="&lt;b&gt;阶段 9：原子提交边界&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF2F2;strokeColor=#F87171;fontColor=#991B1B;fontSize=13;align=center;verticalAlign=middle;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1030" y="102" width="176" height="34" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="s9" value="&lt;b&gt;9. publish&lt;/b&gt;&lt;br&gt;原子发布 LinkMap · dependency edges · leases · InitPlan&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;状态：Initializing；普通线程尚不能进入入口&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#22C55E;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1162" y="220" width="446" height="104" as="geometry"/>
+        </mxCell>
+        <mxCell id="s10" value="&lt;b&gt;10. initialize&lt;/b&gt;&lt;br&gt;依赖先于使用者；每个生命周期恰好一次&lt;br&gt;&lt;font color=&quot;#B45309&quot;&gt;在 loader lock 外执行；从这里开始可能产生业务副作用&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBEB;strokeColor=#F59E0B;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1162" y="370" width="446" height="112" as="geometry"/>
+        </mxCell>
+        <mxCell id="s11" value="&lt;b&gt;11. enter / exit&lt;/b&gt;&lt;br&gt;创建线程 / 进入 main&lt;br&gt;停止新引用 → 等待线程、回调、TLS 静默&lt;br&gt;逆序 fini → unpublish → free&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;region 寿命覆盖最后一次代码可达&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#14B8A6;strokeWidth=2;fontColor=#0F172A;fontSize=15;align=left;verticalAlign=middle;spacingLeft=16;spacingRight=12;arcSize=12;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1162" y="530" width="446" height="150" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e01" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s0" target="s1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s1" target="s2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e23" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s2" target="s3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e34" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s3" target="s4"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e45" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="s4" target="s5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e56" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s5" target="s6"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e67" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s6" target="s7"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e78" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s7" target="s8"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e89" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#DC2626;strokeWidth=3;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="s8" target="s9"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e910" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s9" target="s10"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e1011" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#475569;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="s10" target="s11"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="rollback" value="&lt;b&gt;↩ 阶段 0–8：可回滚事务&lt;/b&gt;&amp;nbsp;&amp;nbsp; 任一步失败只释放本次 regions、临时 lease 和私有元数据；不影响已发布对象" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#38BDF8;strokeWidth=2;fontColor=#0C4A6E;fontSize=14;align=center;verticalAlign=middle;arcSize=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="40" y="810" width="1065" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="side-effect" value="&lt;b&gt;阶段 10 以后：副作用不可自动回滚&lt;/b&gt;&lt;br&gt;失败可销毁整个实例，但不能撤销 ctor 已产生的 IO、线程或外部状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF2F2;strokeColor=#F87171;strokeWidth=2;fontColor=#991B1B;fontSize=14;align=center;verticalAlign=middle;arcSize=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="810" width="510" height="70" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

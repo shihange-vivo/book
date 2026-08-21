@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="920" viewBox="0 0 1680 920" role="img" aria-labelledby="title desc">
+  <title id="title">BlueOS 动态加载与动态链接统一十二阶段流水线</title>
+  <desc id="desc">流程分为准备事务、依赖与链接、提交与生命周期三部分。阶段零到八可以回滚，阶段九原子提交，阶段十初始化开始产生不可自动回滚的副作用。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+    <style>
+      text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", sans-serif; fill: #0f172a; }
+      .phase-title { font-size: 18px; font-weight: 700; }
+      .phase-sub { font-size: 13px; fill: #64748b; }
+      .stage-title { font-size: 16px; font-weight: 700; }
+      .stage-body { font-size: 13px; fill: #334155; }
+      .stage-note { font-size: 12px; fill: #64748b; }
+      .arrow { fill: none; stroke: #475569; stroke-width: 2.4; stroke-linejoin: round; marker-end: url(#arrow); }
+      .arrow-red { fill: none; stroke: #dc2626; stroke-width: 3; stroke-linejoin: round; marker-end: url(#arrow-red); }
+    </style>
+  </defs>
+
+  <rect width="1680" height="920" fill="#ffffff"/>
+  <text x="840" y="50" text-anchor="middle" font-size="28" font-weight="700">动态加载与动态链接：统一十二阶段流水线</text>
+  <text x="840" y="82" text-anchor="middle" font-size="14" fill="#475569">从未受信任 artifact 到可运行实例；阶段 0–8 可回滚，9 原子提交，10 开始产生不可自动回滚的业务副作用</text>
+
+  <rect x="40" y="120" width="530" height="660" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+  <rect x="595" y="120" width="510" height="660" rx="18" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+  <rect x="1130" y="120" width="510" height="660" rx="18" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+
+  <text class="phase-title" x="72" y="160" fill="#1e3a8a">A. 准备事务（0–4）</text>
+  <text class="phase-sub" x="72" y="182">输入校验、布局和私有映像</text>
+  <text class="phase-title" x="627" y="160" fill="#5b21b6">B. 依赖与链接（5–8）</text>
+  <text class="phase-sub" x="627" y="182">冻结可见性并完成所有写入</text>
+  <text class="phase-title" x="1162" y="160" fill="#166534">C. 提交与生命周期（9–11）</text>
+  <text class="phase-sub" x="1162" y="182">原子可见、初始化、运行和回收</text>
+
+  <path class="arrow" d="M305 288 V306"/>
+  <path class="arrow" d="M305 390 V408"/>
+  <path class="arrow" d="M305 492 V510"/>
+  <path class="arrow" d="M305 594 V612"/>
+  <path class="arrow" d="M538 660 H582 V267 H627"/>
+  <path class="arrow" d="M850 314 V344"/>
+  <path class="arrow" d="M850 438 V468"/>
+  <path class="arrow" d="M850 562 V592"/>
+  <path class="arrow-red" d="M1073 645 H1117 V272 H1162"/>
+  <path class="arrow" d="M1385 324 V370"/>
+  <path class="arrow" d="M1385 482 V530"/>
+
+  <rect x="1116" y="144" width="3" height="612" fill="#ef4444" opacity="0.7"/>
+  <rect x="1030" y="102" width="176" height="34" rx="12" fill="#fef2f2" stroke="#f87171"/>
+  <text x="1118" y="124" text-anchor="middle" font-size="13" font-weight="700" fill="#991b1b">阶段 9：原子提交边界</text>
+
+  <g>
+    <rect x="72" y="204" width="466" height="84" rx="14" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+    <text class="stage-title" x="90" y="230">0. 准入</text>
+    <text class="stage-body" x="90" y="251">格式 · class · machine · ABI · 来源 · 配额</text>
+    <text class="stage-note" x="90" y="273">输出：ArtifactIdentity</text>
+  </g>
+  <g>
+    <rect x="72" y="306" width="466" height="84" rx="14" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+    <text class="stage-title" x="90" y="332">1. 预扫描</text>
+    <text class="stage-body" x="90" y="353">phdr / shdr / dynamic 概要；checked arithmetic</text>
+    <text class="stage-note" x="90" y="375">输出：ImageLayout</text>
+  </g>
+  <g>
+    <rect x="72" y="408" width="466" height="84" rx="14" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+    <text class="stage-title" x="90" y="434">2. reserve / allocate</text>
+    <text class="stage-body" x="90" y="455">定义 load bias；建立未发布 regions</text>
+    <text class="stage-note" x="90" y="477">此时其他线程不可见</text>
+  </g>
+  <g>
+    <rect x="72" y="510" width="466" height="84" rx="14" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+    <text class="stage-title" x="90" y="536">3. copy / zero</text>
+    <text class="stage-body" x="90" y="557">复制 p_filesz；显式清零 BSS</text>
+    <text class="stage-note" x="90" y="579">不依赖 allocator 恰好返回零内存</text>
+  </g>
+  <g>
+    <rect x="72" y="612" width="466" height="96" rx="14" fill="#fff" stroke="#3b82f6" stroke-width="2"/>
+    <text class="stage-title" x="90" y="640">4. runtime metadata</text>
+    <text class="stage-body" x="90" y="663">解析 dynsym / hash / reloc / init / fini</text>
+    <text class="stage-note" x="90" y="686">目标地址经 load bias 与 region 范围校验</text>
+  </g>
+
+  <g>
+    <rect x="627" y="220" width="446" height="94" rx="14" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+    <text class="stage-title" x="645" y="248">5. 依赖发现</text>
+    <text class="stage-body" x="645" y="271">DT_NEEDED 闭包；FileIdentity / SONAME 去重</text>
+    <text class="stage-note" x="645" y="294">限制深度、数量、环策略和所有权边</text>
+  </g>
+  <g>
+    <rect x="627" y="344" width="446" height="94" rx="14" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+    <text class="stage-title" x="645" y="372">6. symbol scope</text>
+    <text class="stage-body" x="645" y="395">应用链接域 / 系统链接域分离；weak 与 visibility</text>
+    <text class="stage-note" x="645" y="418">在 relocation 前冻结本次查找顺序</text>
+  </g>
+  <g>
+    <rect x="627" y="468" width="446" height="94" rx="14" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+    <text class="stage-title" x="645" y="496">7. relocation</text>
+    <text class="stage-body" x="645" y="519">RELATIVE → data/GOT → PLT（NOW）</text>
+    <text class="stage-note" x="645" y="542">逐次校验目标范围、宽度、对齐和类型</text>
+  </g>
+  <g>
+    <rect x="627" y="592" width="446" height="106" rx="14" fill="#fff" stroke="#8b5cf6" stroke-width="2"/>
+    <text class="stage-title" x="645" y="620">8. seal</text>
+    <text class="stage-body" x="645" y="643">最终 R/W/X · RELRO · D-cache / I-cache 同步</text>
+    <text class="stage-note" x="645" y="666">所有写完成后才能 seal</text>
+    <text class="stage-note" x="645" y="686">任何代码执行前完成 cache sync</text>
+  </g>
+
+  <g>
+    <rect x="1162" y="220" width="446" height="104" rx="14" fill="#fff" stroke="#22c55e" stroke-width="2"/>
+    <text class="stage-title" x="1180" y="248">9. publish</text>
+    <text class="stage-body" x="1180" y="271">原子发布 LinkMap · dependency edges · leases · InitPlan</text>
+    <text class="stage-note" x="1180" y="296">状态：Initializing；普通线程尚不能进入入口</text>
+  </g>
+  <g>
+    <rect x="1162" y="370" width="446" height="112" rx="14" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text class="stage-title" x="1180" y="398">10. initialize</text>
+    <text class="stage-body" x="1180" y="421">依赖先于使用者；每个生命周期恰好一次</text>
+    <text x="1180" y="446" font-size="12" fill="#b45309">在 loader lock 外执行</text>
+    <text x="1180" y="465" font-size="12" fill="#b45309">从这里开始可能产生业务副作用</text>
+  </g>
+  <g>
+    <rect x="1162" y="530" width="446" height="150" rx="14" fill="#fff" stroke="#14b8a6" stroke-width="2"/>
+    <text class="stage-title" x="1180" y="558">11. enter / exit</text>
+    <text class="stage-body" x="1180" y="581">创建线程 / 进入 main</text>
+    <text class="stage-body" x="1180" y="604">停止新引用 → 等待线程、回调、TLS 静默</text>
+    <text class="stage-body" x="1180" y="627">逆序 fini → unpublish → free</text>
+    <text class="stage-note" x="1180" y="654">region 寿命覆盖最后一次代码可达</text>
+  </g>
+
+  <rect x="40" y="810" width="1065" height="70" rx="14" fill="#e0f2fe" stroke="#38bdf8" stroke-width="2"/>
+  <text x="572" y="840" text-anchor="middle" font-size="14" font-weight="700" fill="#0c4a6e">↩ 阶段 0–8：可回滚事务</text>
+  <text x="572" y="862" text-anchor="middle" font-size="13" fill="#0c4a6e">任一步失败只释放本次 regions、临时 lease 和私有元数据；不影响已发布对象</text>
+
+  <rect x="1130" y="810" width="510" height="70" rx="14" fill="#fef2f2" stroke="#f87171" stroke-width="2"/>
+  <text x="1385" y="838" text-anchor="middle" font-size="14" font-weight="700" fill="#991b1b">阶段 10 以后：副作用不可自动回滚</text>
+  <text x="1385" y="860" text-anchor="middle" font-size="12" fill="#991b1b">可销毁实例，但不能撤销 ctor 已产生的 IO、线程或外部状态</text>
+</svg>
