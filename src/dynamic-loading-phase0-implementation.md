@@ -2,11 +2,31 @@
 
 本文是 [BlueOS 动态加载详细实现计划](./dynamic-loading-implementation-plan.md) 中 Phase 0 的独立实施文档。目标不是预先创建一组“以后可能有用”的类型，而是按照正常工程实现顺序推进：每个 commit 先交付一种可以测试的能力，再引入完成该能力所必需的数据结构和方法。
 
-Phase 0 完成后，当前的 `load_elf(buffer, mapper)` 将成为可信单映像 `ImageLoader` 的兼容包装；现有 `ET_DYN` static PIE、fixed-address `ET_EXEC` 和 RISC-V64 relative relocation 继续工作，同时补齐 ARM32 relative relocation、BSS、load bias、错误处理、权限与 cache 基线，为 Phase 0.5 的 `DynamicLinker` 提供稳定输入。
+Phase 0 完成后，当前的 `load_elf(buffer, mapper)` 将成为可信单映像 `ImageLoader` 的兼容包装；现有自包含 `ET_DYN`、fixed-address `ET_EXEC` 和 RISC-V64 relative relocation 继续工作，同时补齐 ARM32 relative relocation、BSS、load bias、错误处理、权限与 cache 基线，为 Phase 0.5 的 `DynamicLinker` 提供稳定输入。
 
-## 1. 当前实现的问题
+## 0. 实施状态（2026-08-25）
 
-当前 [`kernel/loader/src/lib.rs`](../../kernel/loader/src/lib.rs) 的主要问题不是缺少动态链接功能，而是单映像装载本身尚未形成可信基线：
+Phase 0 已在 `kernel` 仓库的 `feat/loader-phase0` 分支按本文顺序完成。实现中发现旧方案把“static PIE”错误地当作启动方输入，因此 C04 同时修正了 C01–C03 的类型契约：公开请求现在只有 `ExpectedElfType::{Dyn, Exec}`，自包含性由 C06 的 `RuntimeFeaturePolicy::Phase0` 在扫描 `PT_DYNAMIC` 后确定。
+
+| 阶段 | Commit | 已交付结果 |
+| --- | --- | --- |
+| C00 | `8b70ca8` | host regression fixture 和 GN test target |
+| C01 | `13173cd` | read-at 输入、ELF header/ABI/type 准入和结构化错误 |
+| C02 | `13b04db` | 自有 program-header 运行时视图 |
+| C03 | `8acde3c` | checked layout、W^X、entry、load bias 和资源上限 |
+| C04 | `57ced2a` | `ExpectedElfType` 修正、fallible allocation 和事务回滚 |
+| C05 | `d1b9f2b` | 分块复制、BSS/gap 清零和 fixed placement 写前预检 |
+| C06 | `8aac272` | 有界 `PT_DYNAMIC` 扫描、Phase 0 策略和 REL/RELA 归一化 |
+| C07 | `f5616f6` | RISC-V64 RELA relative relocation engine |
+| C08 | `1734d4b` | ARM32 REL 隐式 addend 和 ELF32 地址宽度检查 |
+| C09 | `429409b` | cache 同步、RELRO/最终权限、seal 和事务提交 |
+| C10 | `46478c9` | `load_image()` 编排、兼容入口切换和旧管线删除 |
+
+最终验证覆盖 40 个 host tests，以及 RISC-V64 `ET_DYN`、ARM32 `ET_DYN`、RISC-V32 fixed `ET_EXEC` 三条真实 QEMU 执行路径。下面保留按 commit 解释“为什么此时引入这些结构”的实施逻辑；若示例草图与实现细节有差异，以本节 commit 对应的代码和各节标注的修订为准。
+
+## 1. 实施前实现的问题
+
+实施前 [`kernel/loader/src/lib.rs`](../../kernel/loader/src/lib.rs) 的主要问题不是缺少动态链接功能，而是单映像装载本身尚未形成可信基线：
 
 - `p_vaddr + p_memsz`、`p_offset + p_filesz` 等 ELF 输入直接参与未检查算术；
 - 只复制 `p_filesz`，没有显式清零 `p_memsz - p_filesz`，但底层 `Storage` 并不保证零初始化；
@@ -15,7 +35,7 @@ Phase 0 完成后，当前的 `load_elf(buffer, mapper)` 将成为可信单映�
 - `Elf::parse(buffer)` 强制整个文件连续驻留，无法自然接入 VFS read-at 路径；
 - 映像复制完成后立即允许取得 entry，没有 cache 同步和 seal 边界。
 
-当前 [`memory_mapper.rs`](../../kernel/loader/src/memory_mapper.rs) 还存在以下问题：
+实施前 [`memory_mapper.rs`](../../kernel/loader/src/memory_mapper.rs) 还存在以下问题：
 
 - 分配对齐由 loader 自身架构决定，没有采用 ELF 所有 `PT_LOAD` 的最大 `p_align`；
 - `start + size` 等目标范围检查仍可能溢出；
@@ -23,7 +43,7 @@ Phase 0 完成后，当前的 `load_elf(buffer, mapper)` 将成为可信单映�
 - 分配失败不能可靠地形成结构化 OOM 错误；
 - `MemoryMapper` 同时承担布局、分配、访问和成功结果保存，难以表达失败回滚。
 
-因此 Phase 0 必须先修正单映像 loader，不能直接在当前 `load_elf()` 上叠加 `DT_NEEDED`、符号解析和 DSO 生命周期。
+因此 Phase 0 必须先修正单映像 loader，不能直接在旧 `load_elf()` 上叠加 `DT_NEEDED`、符号解析和 DSO 生命周期。
 
 ## 2. Phase 0 的范围
 
@@ -55,7 +75,26 @@ Phase 0 不实现：
 
 这些能力分别属于 Phase 0.5、Phase 1 或 Phase 3，不应以空结构、占位 trait 方法或未使用字段的形式提前进入 Phase 0。
 
-### 2.3 完成标准
+### 2.3 ELF 类型与运行时能力的职责边界
+
+启动方不声明“这个应用是 static PIE”。对内核而言，应用在真正启动前只是一个 ELF 工件；`ET_DYN` 也不能区分自包含 PIE、动态链接可执行文件和共享对象。因此公开请求只表达可以由 ELF header 直接、常数时间验证的类型约束：
+
+```rust
+pub enum ExpectedElfType {
+    Dyn,
+    Exec,
+}
+```
+
+- `Dyn` 要求 `e_type == ET_DYN`，布局采用可移动放置并计算 load bias；
+- `Exec` 要求 `e_type == ET_EXEC`，布局采用 fixed placement；
+- 不在 header admission 阶段推断“static PIE”或“动态应用”；
+- Phase 0 在 C06 对 `PT_DYNAMIC` 做有界扫描，并通过 `RuntimeFeaturePolicy` 拒绝 `DT_NEEDED`、符号型 relocation 等本阶段不支持的语义；通过该策略意味着“本次可以由 Phase 0 单映像管线完成”，而不是给工件永久贴上 static PIE 标签；
+- Phase 0.5 放宽运行时策略并建立依赖图，但沿用同一个 `ExpectedElfType::Dyn` 请求 ABI。
+
+扫描 `PT_DYNAMIC` 不是为了额外识别应用类别；relocation 本来就必须读取这些元数据。扫描次数受 `max_dynamic_entries` 限制，复杂度与后续 relocation 数量校验相比不是独立的启动成本。
+
+### 2.4 完成标准
 
 完成标准不是“新 API 已经存在”，而是：
 
@@ -64,7 +103,7 @@ Phase 0 不实现：
 3. 所有 ELF 范围在产生副作用前完成验证；
 4. S2–S8 任一步失败都不泄漏 owned allocation；
 5. 只有 `SealedImage` 能暴露 entry；
-6. ARM32 host fixture、RISC-V64 static PIE、fixed `ET_EXEC` 和 QEMU 回归全部通过。
+6. ARM32 host fixture、现有 RISC-V64 `ET_DYN`、fixed `ET_EXEC` 和 QEMU 回归全部通过。
 
 ## 3. 总体实现主线
 
@@ -128,7 +167,7 @@ loader: add host regression test scaffolding
 后续会依次替换 reader、parser、layout、memory 和 relocation。实现前需要能区分：
 
 - 有意拒绝不安全输入；
-- 无意破坏已有 static PIE 或 `ET_EXEC`；
+- 无意破坏已有自包含 `ET_DYN` 或 `ET_EXEC`；
 - 新实现计算结果错误；
 - 失败路径泄漏资源。
 
@@ -138,7 +177,7 @@ loader: add host regression test scaffolding
 - 增加 test-only `ElfFixtureBuilder`；
 - builder 能构造 ELF32/ELF64 header、program header、dynamic table 和 REL/RELA 表；
 - fixture 默认不带 section header，避免测试继续依赖完整链接产物；
-- 固化现有 RISC-V64 static PIE 和 fixed `ET_EXEC` 的兼容行为；
+- 固化现有 RISC-V64 `ET_DYN` 和 fixed `ET_EXEC` 的兼容行为；
 - 保留现有 QEMU execution tests；
 - 将纯 malformed ELF 测试放到 host debug，不再全部隐藏在 `#[cfg(not(debug_assertions))]` 后。
 
@@ -226,7 +265,7 @@ impl ImageLoader {
 
 1. `reader.len()` 和 `max_file_len`；
 2. magic、class、endianness、ELF version；
-3. `e_type` 是否匹配 `StaticPie/FixedExec`；
+3. `e_type` 是否匹配调用方要求的 `Dyn/Exec`；
 4. machine 和 artifact profile；
 5. `e_ehsize/e_phentsize`；
 6. `e_phnum` 上限；
@@ -253,9 +292,9 @@ pub enum Endian {
     Big,
 }
 
-pub enum ImageKind {
-    StaticPie,
-    FixedExec,
+pub enum ExpectedElfType {
+    Dyn,
+    Exec,
 }
 
 pub struct ArtifactProfile {
@@ -270,7 +309,7 @@ pub struct LoadLimits {
 }
 
 pub struct ArtifactRequest {
-    expected_kind: ImageKind,
+    expected_elf_type: ExpectedElfType,
     profile: ArtifactProfile,
     limits: LoadLimits,
 }
@@ -286,7 +325,7 @@ pub struct AdmittedArtifact<R> {
 这些类型的当前目的：
 
 - `ArtifactProfile`：描述 loader 能处理的目标 ELF ABI；
-- `ArtifactRequest`：描述一次单映像装载要求；
+- `ArtifactRequest`：描述一次单映像装载的 ELF 类型、ABI 和资源要求，不声明应用链接模型；
 - `AdmittedArtifact`：证明 header、ABI 和 phdr table 外层范围已经验证；
 - `LoadLimits`：让文件长度和 phdr 数量在 allocation 前受控；
 - `LoadError`：让测试和上层能够区分 read/parse/validate 错误。
@@ -431,7 +470,6 @@ loader: validate and plan image layout
 
 ```text
 src/image/layout.rs
-src/image/policy.rs
 ```
 
 固定检查顺序：
@@ -513,7 +551,7 @@ impl ImageLayout {
     fn load_bias_for(
         &self,
         mapped_base: TargetAddr,
-        kind: ImageKind,
+        expected_elf_type: ExpectedElfType,
     ) -> LoadResult<TargetAddr>;
 
     fn locate_vaddr_range(
@@ -528,11 +566,11 @@ impl ImageLayout {
 公式：
 
 ```text
-StaticPie:
+Dyn:
     B = mapped_base - aligned_min_vaddr
     runtime(vaddr) = B + vaddr
 
-FixedExec:
+Exec:
     mapped_base = aligned_min_vaddr
     B = 0
 ```
@@ -706,8 +744,8 @@ fn zero(
 
 复制规则：
 
-- `StaticPie` owned allocation：先清零整个 `image_span`，再复制所有 segment 的 `p_filesz`；
-- `FixedExec`：只清零每个 segment 的 `p_memsz`，不修改 segment gap；
+- `Dyn` owned allocation：先清零整个 `image_span`，再复制所有 segment 的 `p_filesz`；
+- `Exec` fixed placement：只清零每个 segment 的 `p_memsz`，不修改 segment gap；
 - 使用固定大小 scratch buffer 分块调用 `read_exact_at()`，建议从 512 字节开始，根据线程栈预算调整；
 - `LoadedRegion` 只覆盖真实 `PT_LOAD`；
 - allocation 内的 gap 即使已经被清零，也不能被 `locate()` 当成合法映像内存；
@@ -722,30 +760,24 @@ pub struct TargetLocation {
 }
 
 pub struct LoadedRegion {
-    target_range: TargetRange,
-    file_range: Option<FileRange>,
+    vaddr_range: TargetRange,
+    runtime_range: TargetRange,
+    file_range: FileRange,
+    allocation_offset: u64,
     logical_permissions: MemoryPermissions,
 }
 
-pub struct LoadedImageData {
-    kind: ImageKind,
-    profile: ArtifactProfile,
+pub struct MappedImage {
+    request: ArtifactRequest,
     allocation: ImageAllocation,
+    image_span: u64,
     load_bias: TargetAddr,
     entry: TargetAddr,
+    canonical_entry: TargetAddr,
     regions: Box<[LoadedRegion]>,
+    dynamic: Option<DynamicSegmentInfo>,
+    relro: Option<TargetRange>,
 }
-
-pub struct LoadedImage<S> {
-    data: LoadedImageData,
-    state: S,
-}
-
-pub struct MappedState {
-    parsed: ParsedImage,
-}
-
-pub type MappedImage = LoadedImage<MappedState>;
 ```
 
 核心方法：
@@ -762,17 +794,20 @@ impl ImageLoader {
         M: ImageMemory;
 }
 
-impl<S> LoadedImage<S> {
-    fn target_addr(&self, vaddr: TargetAddr) -> LoadResult<TargetAddr>;
-
-    fn locate(
+impl MappedImage {
+    fn locate_vaddr(
         &self,
         vaddr: TargetAddr,
-        width: u64,
+        len: u64,
         permissions: MemoryPermissions,
     ) -> LoadResult<TargetLocation>;
 
-    fn contains_executable(&self, addr: TargetAddr) -> bool;
+    fn runtime_address(
+        &self,
+        vaddr: TargetAddr,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<TargetAddr>;
 }
 ```
 
@@ -788,7 +823,7 @@ Fixed range 不属于 loader，因此不能像 owned allocation 一样通过释�
 ### 9.5 测试与 Gate
 
 - `FakeMemory` 初始填充 `0xa5`，BSS 最终为零；
-- static PIE allocation gap 为零，但 `locate()` 拒绝 gap；
+- owned `ET_DYN` allocation gap 为零，但 `locate()` 拒绝 gap；
 - fixed exec 不修改 segment gap；
 - segment 大于 scratch buffer；
 - 短读和每个 write/zero 故障点；
@@ -836,7 +871,8 @@ fn read(
 - 识别 `DT_RELR/DT_RELRSZ/DT_RELRENT`，Phase 0 profile 未启用时返回 `UnsupportedByProfile`；
 - 拒绝 `DT_NEEDED`、`DT_JMPREL/DT_PLTREL` 和 `DT_TEXTREL`；
 - 拒绝 TLS、symbol version、IFUNC、COPY 等 Phase 0 不支持语义；
-- 当前真实 static PIE 中的 `FLAGS_1/DEBUG/SYMTAB/STRTAB/HASH/GNU_HASH` 可以作为“已知但本阶段不消费”的 metadata 接受，不能仅因为当前未使用就拒绝真实基线工件；
+- 当前真实 `ET_DYN` 应用中的 `FLAGS_1/DEBUG/SYMTAB/STRTAB/HASH/GNU_HASH` 可以作为“已知但本阶段不消费”的 metadata 接受，不能仅因为当前未使用就拒绝真实基线工件；
+- 自包含性在这里由策略结果确定：存在 `DT_NEEDED`、PLT relocation 或需要符号解析的 relocation 时，Phase 0 拒绝；不得回头把该结论缓存成 header admission 所需的应用类别；
 - relocation 数量和 dynamic entry 数量均受 `LoadLimits` 控制。
 
 ### 10.3 因此才引入的数据结构
@@ -869,14 +905,12 @@ pub struct RelocationRecord {
 
 pub struct RuntimeImageMetadata {
     relocations: Box<[RelocationRecord]>,
-    relro: Option<TargetRange>,
 }
 
-pub struct RuntimeMetadataState {
+pub struct RuntimeImage {
+    mapped: MappedImage,
     metadata: RuntimeImageMetadata,
 }
-
-pub type RuntimeImage = LoadedImage<RuntimeMetadataState>;
 ```
 
 `LoadLimits` 此时扩展：
@@ -917,12 +951,12 @@ impl MappedImage {
 建议提交：
 
 ```text
-loader: migrate RISC-V relative relocations
+loader: apply RISC-V relative relocations
 ```
 
 ### 11.1 本提交要解决的问题
 
-RISC-V64 static PIE 是当前已有可执行基线。先把它迁移到通用 engine，可以在增加 ARM32 前证明新 reader/layout/memory 抽象没有破坏旧行为。
+RISC-V64 自包含 `ET_DYN` 是当前已有可执行基线。先把它迁移到通用 engine，可以在增加 ARM32 前证明新 reader/layout/memory 抽象没有破坏旧行为。
 
 ### 11.2 实现内容
 
@@ -930,9 +964,7 @@ RISC-V64 static PIE 是当前已有可执行基线。先把它迁移到通用 en
 
 ```text
 src/relocation/mod.rs
-src/relocation/model.rs
-src/relocation/arch/mod.rs
-src/relocation/arch/riscv.rs
+src/relocation/riscv.rs
 ```
 
 支持：
@@ -958,49 +990,38 @@ value = B + A
 ### 11.3 因此才引入的数据结构
 
 ```rust
-#[repr(transparent)]
-pub struct TargetWord(u64);
-
 pub enum WordWidth {
     U32,
     U64,
 }
 
-pub enum RelocationKind {
-    Relative,
+pub enum AddendEncoding {
+    Implicit,
+    Explicit,
 }
 
-pub struct RelocationRequest {
-    location: TargetLocation,
-    base: TargetAddr,
-    addend: i64,
-    kind: RelocationKind,
+pub struct TargetWord {
+    width: WordWidth,
+    endian: Endian,
 }
 
 pub trait ArchRelocator {
-    fn decode(
-        &self,
-        raw_type: u32,
-        class: ElfClass,
-    ) -> LoadResult<RelocationKind>;
-
-    fn apply(
-        &self,
-        request: &RelocationRequest,
-        memory: &mut dyn ImageMemory,
-    ) -> LoadResult<()>;
+    fn machine(&self) -> u16;
+    fn class(&self) -> ElfClass;
+    fn word_width(&self) -> WordWidth;
+    fn relative_type(&self) -> u32;
+    fn addend_encoding(&self) -> AddendEncoding;
 }
 
-pub struct RiscvRelocator;
+pub struct Riscv64Relocator;
 
-pub struct RelocatedState {
+pub struct RelocatedImage {
+    mapped: MappedImage,
     metadata: RuntimeImageMetadata,
 }
-
-pub type RelocatedImage = LoadedImage<RelocatedState>;
 ```
 
-`TargetWord/WordWidth` 到本提交才有实际用途，因为此时第一次按目标 ELF 字宽读写 relocation value。
+`ArchRelocator` 只描述架构 ABI 差异；通用 engine 负责先生成全部 `RelocationOperation`，预检完成后再写回。`TargetWord/WordWidth` 到本提交才有实际用途，因为此时第一次按目标 ELF 字宽和端序读写 relocation value。
 
 ### 11.4 测试与 Gate
 
@@ -1037,7 +1058,7 @@ ARM32 与 RISC-V64 的关键差异不是 relocation 常量名称，而是：
 新增：
 
 ```text
-src/relocation/arch/arm.rs
+src/relocation/arm.rs
 ```
 
 支持：
@@ -1065,7 +1086,7 @@ DT_REL + R_ARM_RELATIVE
 pub struct ArmRelocator;
 ```
 
-不增加第二套 relocation engine，复用 C07 的 `RelocationRequest`、word access 和 `RelocatedImage`。
+不增加第二套 relocation engine，复用 C07 的 `TargetWord`、预检操作列表和 `RelocatedImage`。
 
 ### 12.4 测试与 Gate
 
@@ -1084,7 +1105,7 @@ pub struct ArmRelocator;
 建议提交：
 
 ```text
-loader: seal images before exposing entry
+loader: seal images after cache and permission updates
 ```
 
 ### 13.1 本提交要解决的问题
@@ -1101,11 +1122,7 @@ relocation 完成只表示映像字节暂时正确。代码可执行前仍需要
 
 ```rust
 pub trait CodeCache {
-    fn sync_instruction_cache(
-        &mut self,
-        allocation: AllocationId,
-        ranges: &[TargetRange],
-    ) -> LoadResult<()>;
+    fn synchronize(&mut self, runtime_range: TargetRange) -> LoadResult<()>;
 }
 ```
 
@@ -1114,10 +1131,10 @@ pub trait CodeCache {
 ```rust
 fn protect(
     &mut self,
-    allocation: AllocationId,
-    range: TargetRange,
+    location: TargetLocation,
+    len: u64,
     permissions: MemoryPermissions,
-) -> LoadResult<ProtectionResult>;
+) -> LoadResult<ProtectionLevel>;
 ```
 
 `SealPlan` 固定形成：
@@ -1150,28 +1167,26 @@ fn protect(
 
 ```rust
 pub struct SealPlan {
-    protections: Box<[ProtectionRange]>,
-    relro: Box<[TargetRange]>,
-    executable_ranges: Box<[TargetRange]>,
+    ranges: Box<[SealRange]>,
 }
 
-pub enum ProtectionResult {
+pub enum ProtectionLevel {
+    Hardware,
     LogicalOnly,
-    HardwareEnforced,
 }
 
-pub struct AppliedProtection {
-    range: TargetRange,
-    requested: MemoryPermissions,
-    result: ProtectionResult,
+pub struct SealRange {
+    location: TargetLocation,
+    runtime_range: TargetRange,
+    permissions: MemoryPermissions,
 }
 
-pub struct SealedState {
+pub struct SealedImage {
+    mapped: MappedImage,
     metadata: RuntimeImageMetadata,
-    applied: Box<[AppliedProtection]>,
+    seal_plan: SealPlan,
+    protection: ProtectionLevel,
 }
-
-pub type SealedImage = LoadedImage<SealedState>;
 ```
 
 此时把 C04 的 test-only disarm 收敛为正式事务提交接口：
@@ -1189,7 +1204,8 @@ impl<M: ImageMemory> ImageLoadTransaction<'_, M> {
 ```rust
 impl SealedImage {
     pub fn entry(&self) -> TargetAddr;
-    pub fn protection_results(&self) -> &[AppliedProtection];
+    pub fn protection(&self) -> ProtectionLevel;
+    pub fn seal_plan(&self) -> &SealPlan;
 }
 ```
 
@@ -1221,18 +1237,19 @@ C01–C09 已经分别证明读取、解析、布局、分配、复制、relocat
 ### 14.2 新高层 API
 
 ```rust
-pub fn load_static_image<R, M, C>(
+pub fn load_image<R, M, C, A>(
     reader: R,
     request: ArtifactRequest,
     memory: &mut M,
     cache: &mut C,
-    runtime_policy: &RuntimeFeaturePolicy,
-    relocator: &dyn ArchRelocator,
+    runtime_policy: RuntimeFeaturePolicy,
+    relocator: &A,
 ) -> LoadResult<SealedImage>
 where
     R: ElfReader,
     M: ImageMemory,
-    C: CodeCache;
+    C: CodeCache,
+    A: ArchRelocator + ?Sized;
 ```
 
 内部只负责编排：
@@ -1268,7 +1285,7 @@ pub fn load_elf(
 1. 根据 mapper mode 构造 `ArtifactRequest`；
 2. 构造 `SliceElfReader`；
 3. 构造 `MemoryMapper` 和当前架构 cache adapter；
-4. 调用 `load_static_image()`；
+4. 调用 `load_image()`；
 5. 成功后把 sealed entry 安装到 mapper；
 6. 将结构化 `LoadError` 映射为兼容静态字符串。
 
@@ -1284,7 +1301,7 @@ pub fn load_elf(
 - 核心路径中的泛型 `write_value_at<T>`；
 - 对未知 relocation 的静默跳过。
 
-当前 loader 的生产 `//librs` 依赖已经移除，本提交无需重复修改。
+本提交同时移除旧实现不再需要的生产 `//librs` 依赖。
 
 ### 14.5 Gate
 
@@ -1294,7 +1311,7 @@ pub fn load_elf(
 - 旧入口不包含 ELF 实现细节；
 - 新入口返回结构化错误；
 - `MemoryMapper::real_entry()` 只在 seal 成功后可用；
-- ARM32 host fixture、RISC-V64 static PIE、fixed `ET_EXEC` 和 QEMU 回归通过。
+- ARM32 host fixture、现有 RISC-V64 `ET_DYN`、fixed `ET_EXEC` 和 QEMU 回归通过。
 
 ## 15. 最终代码布局
 
@@ -1307,22 +1324,20 @@ kernel/loader/src/
   limits.rs
   reader.rs
   memory.rs
+  cache.rs
 
   image/
     mod.rs
     parser.rs
-    policy.rs
     layout.rs
     loaded.rs
     metadata.rs
+    seal.rs
 
   relocation/
     mod.rs
-    model.rs
-    arch/
-      mod.rs
-      arm.rs
-      riscv.rs
+    arm.rs
+    riscv.rs
 
   memory_mapper.rs       # Phase 0 先保留为兼容 adapter
 ```
@@ -1339,7 +1354,7 @@ kernel/loader/src/
 | --- | --- | --- |
 | `LoadError` | C01 | 表达 read/header/admission 错误，后续按消费者扩展 stage/kind/context |
 | `ElfReader/SliceElfReader` | C01 | 读取 header；后续同一接口读取 phdr 和 segment |
-| `ArtifactProfile/Request` | C01 | 描述单映像 ELF ABI 与类型要求 |
+| `ArtifactProfile/Request` | C01 | 描述单映像 ELF ABI 与 `Dyn/Exec` header 类型要求，不表达链接模型 |
 | `TargetAddr/FileRange` | C02 | 区分 ELF 虚址与文件范围 |
 | `ParsedImage` | C02 | 持有不借用输入文件的 program-header 视图 |
 | `TargetRange/ImageLayout` | C03 | 在 allocation 前证明完整布局有界且合法 |
@@ -1393,10 +1408,10 @@ kernel/loader/src/
 
 ### 17.3 集成回归
 
-- 现有 static PIE 加载并执行；
+- 现有自包含 `ET_DYN` 应用加载并执行；
 - fixed `ET_EXEC` 加载并执行；
 - fixed range 越界在第一次写之前失败；
-- RISC-V64 static PIE 使用新 engine；
+- RISC-V64 `ET_DYN` 应用使用新 engine；
 - ARM32 `DT_REL/R_ARM_RELATIVE` host fixture 精确比较目标字节；
 - 大 BSS 在非零预填充内存上仍为零；
 - 最低 vaddr 非零时 entry 和 relocation value 正确；
@@ -1405,33 +1420,31 @@ kernel/loader/src/
 建议最终运行：
 
 ```bash
-./build.sh none kernel/loader:run_loader_unittest
-./build.sh qemu_riscv64 kernel/loader:check_loader
-./build.sh qemu_mps2_an385 kernel/loader:check_loader
-ninja -C out/qemu_riscv64.release.dsc check_all
-ninja -C out/qemu_mps2_an385.release.dsc check_all
+ninja -C out/qemu_riscv64.release.dsc kernel/loader:check_loader kernel/loader:blueos_loader_clippy
+ninja -C out/qemu_mps2_an385.release.dsc kernel/loader:check_loader kernel/loader:blueos_loader_clippy
+ninja -C out/seeed_xiao_esp32c3.release.dsc kernel/loader:check_loader kernel/loader:blueos_loader_clippy
 ```
 
-如果对应 target 的最终 GN 名称在 C00 实现时有所调整，文档和 CI 命令必须在同一 commit 更新，不能保留不可运行的示例命令。
+ESP32-C3 的 image action 会下载官方 bootloader 和 partition table；离线环境应预置这两个输入。若 Python TLS trust store 不完整，可先通过系统下载工具取得同一官方 release 文件，再用 `build/scripts/gen_esp32_image.py build_image` 生成测试镜像。
 
 ## 18. Phase 0 最终验收清单
 
-- [ ] 所有 ELF 数值先 checked arithmetic，后转换为 host 类型；
-- [ ] parser 不依赖 section header；
-- [ ] `p_filesz <= p_memsz`、alignment、同余、overlap 和 entry 权限均校验；
-- [ ] 非零最低 vaddr 使用正确 load bias；
-- [ ] static PIE owned allocation 和 BSS 确定性清零；
-- [ ] `locate()` 拒绝 allocation gap 和错误权限；
-- [ ] relative relocation 校验 owner、范围、字宽、端序、对齐和溢出；
-- [ ] 未知或非白名单 relocation fail closed；
-- [ ] `DT_NEEDED/TEXTREL/PT_TLS/PT_INTERP` 等 Phase 0 不支持特性被拒绝；
-- [ ] cache backend 缺失时加载失败；
-- [ ] 无硬件保护时准确报告 `LogicalOnly`；
-- [ ] S2–S8 每个故障点均不泄漏或 double-free；
-- [ ] 只有 `SealedImage` 暴露 entry；
-- [ ] fixed `ET_EXEC` 在所有 preflight 完成前不执行第一次写；
-- [ ] 旧 `load_elf()` 只剩兼容包装；
-- [ ] 仓库中没有第二套 parser、copy 或 relocation 实现；
-- [ ] ARM32 host fixture、RISC-V64 static PIE、fixed `ET_EXEC` 和 QEMU 回归通过。
+- [x] 所有 ELF 数值先 checked arithmetic，后转换为 host 类型；
+- [x] parser 不依赖 section header；
+- [x] `p_filesz <= p_memsz`、alignment、同余、overlap 和 entry 权限均校验；
+- [x] 非零最低 vaddr 使用正确 load bias；
+- [x] owned `ET_DYN` allocation 和 BSS 确定性清零；
+- [x] `locate()` 拒绝 allocation gap 和错误权限；
+- [x] relative relocation 校验 owner、范围、字宽、端序、对齐和溢出；
+- [x] 未知或非白名单 relocation fail closed；
+- [x] `DT_NEEDED/TEXTREL/PT_TLS/PT_INTERP` 等 Phase 0 不支持特性被拒绝；
+- [x] cache backend 缺失时加载失败；
+- [x] 无硬件保护时准确报告 `LogicalOnly`；
+- [x] S2–S8 失败由同一个事务 rollback，不泄漏或 double-free；
+- [x] 只有 `SealedImage` 公开暴露 entry；
+- [x] fixed `ET_EXEC` 在所有 source/target/final-permission preflight 完成前不执行第一次写；
+- [x] 旧 `load_elf()` 只剩兼容包装；
+- [x] 仓库中没有第二套生产 parser、copy 或 relocation 实现；
+- [x] ARM32 host fixture、RISC-V64 `ET_DYN`、RISC-V32 fixed `ET_EXEC` 和 QEMU 回归通过。
 
 达到以上条件后，Phase 0.5 可以直接以 `RuntimeImage/RelocatedImage/SealedImage` 为基础增加 dependency graph、symbol scope 和多映像 `LinkSession`，无需再次修改单映像的地址、布局、复制、relative relocation 和 seal 语义。
