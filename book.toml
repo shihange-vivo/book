@@ -1,6 +1,6 @@
 [book]
 title = "BlueOS kernel"
-author = "vivo BlueOS Project Developers"
+authors = ["vivo BlueOS Project Developers"]
 description = "A development guide of BlueOS kernel"
 
 [build]

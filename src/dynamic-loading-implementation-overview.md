@@ -4,6 +4,8 @@
 
 所有模块、文件和公共类型名称以调研报告 [2.12 BlueOS 模块命名规范与参考词典](./dynamic-loading-survey.md#212-blueos-模块命名规范与参考词典) 为准。
 
+Phase 0 的代码基线和收口设计以 [BlueOS 动态加载 Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为准：`P0-C00`–`P0-C12` 是已运行的功能基线，仍需 `P0-C13`–`P0-C15` 关闭事务所有权、fixed 失败语义、ABI/policy、protection/cache capability 与最终 fuzz/fault gate。
+
 ## 1. 方案结论
 
 BlueOS 当前采用 RTOS 线程模型和共享地址空间，已经有一个只能装载单 ELF、仅支持少量 RISC-V 相对重定位的 loader。推荐方案是在现有 `blueos_loader` 内逐步扩充动态链接能力，而不是新建另一套 loader，也不在当前阶段引入用户态 `ld.so`。
@@ -35,6 +37,8 @@ ElfReader / ImageMemory / ArchRelocator
 - 主程序和 DSO 使用标准 `ET_DYN + PT_DYNAMIC + DT_NEEDED`。
 - 主程序不带 `PT_INTERP`，由内核中的 `ApplicationLoader` 在启动前完成动态链接。
 - 保留现有 `blueos_loader` crate，在内部拆分 `ImageLoader + DynamicLinker`。
+- Phase 0 的单映像本地提交必须遵循 `PreparedImage → ReadyImageCommit → committed owner`；所有可失败检查在 commit 前完成，commit 后由唯一 allocation lease owner 保活并公开 entry。
+- owned 映像失败释放 lease；borrowed fixed 一旦被修改后失败就进入 `Poisoned`，除非 backend 提供真实恢复事务，不能把清理 bookkeeping 描述为内容回滚。
 - 首版优先支持 ARM32 Thumb v7-M soft-float EABI，固定 target 为 `thumbv7m-vivo-blueos-newlibeabi`、验证平台为 `qemu_mps2_an385`；之后扩展 Thumb v8-M hard-float、RISC-V64、AArch64 和 RISC-V32。
 - 系统按需装载并共享一份 `libc.so.1`，应用通过 lease 保活。
 - 首版采用立即绑定、emutls 和整 ThreadGroup 回收。

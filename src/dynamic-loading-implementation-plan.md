@@ -2,6 +2,8 @@
 
 本文基于主报告 [BlueOS 动态加载调研报告](./dynamic-loading-survey.md) 中已经确定的实现方案，结合当前 `blueos_loader`、内核线程/VFS/内存接口、`librs`、emutls 和 GN 工具链现状，给出可以直接拆分为工程任务的详细实现计划。
 
+Phase 0 的当前代码基线、最终接口和验收门禁以 [BlueOS 动态加载 Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为准。本计划中的阶段/接口草图描述长期目标；如果与该文档的 `P0-C00`–`P0-C15` 冲突，Phase 0 实现应以后者为准，不能用后续多映像设计弱化单映像事务不变量。
+
 模块、文件和公共类型的命名以调研报告 [2.12 BlueOS 模块命名规范与参考词典](./dynamic-loading-survey.md#212-blueos-模块命名规范与参考词典) 为唯一基准；本计划只展开实现，不另造同义名称。
 
 针对评审提出的应用定义、命名和安全问题，本计划先冻结以下约束：
@@ -26,11 +28,12 @@ Phase 1 的 QEMU/MVP 只允许运行内置或构建期 allowlist 的开发工件
 
 > 在 `qemu_mps2_an385` 上使用 `thumbv7m-vivo-blueos-newlibeabi`，由 shell 执行 `run /apps/hello/app.elf arg1`，加载标准 ARM32 Thumb `ET_DYN` 主程序和按需共享的 `libc.so.1`，完成符号解析、NOW relocation、RELRO、cache sync、构造函数、argv/auxv、emutls 和整 ThreadGroup 回收。
 
-本文使用三套互不替代的编号：
+本文使用四套互不替代的编号：
 
 - `S0`–`S11` 表示一次应用启动内部的**运行时流水线阶段**，对象只能沿 `admit → plan → map → relocate → seal → publish → initialize → run/reap` 前进。
 - Phase 0–3 表示跨模块的**工程交付阶段**，一个 Phase 会实现若干运行时阶段。
-- `C01`、`C02`……表示建议的**最小可审查提交单元**；每个提交都必须保持所属仓库可编译，并带对应的单元或集成测试。
+- `P0-C00`–`P0-C15` 表示 Phase 0 分支内的**本地提交序列**；其中 `P0-C00`–`P0-C12` 已有真实 commit，后续三个提交负责收口。
+- `C11`、`C12`……表示 Phase 0.5 以后的**跨仓库最小可审查提交单元**；每个提交都必须保持所属仓库可编译，并带对应的单元或集成测试。早期草案中的 `C01`–`C10` 已由真实的 `P0-Cxx` 序列取代，不再复用。
 
 第 3–9 节按组件给出类型定义，第 11 节再按 `S0`–`S11` 重新归属这些类型和方法；第 12、13 节分别给出工程 Phase 与实际提交顺序。实现时以第 11 节的阶段输出类型作为接口边界，不能用一个带大量 `Option` 和布尔标志的对象跨越整条流水线。
 
@@ -1347,7 +1350,7 @@ ArtifactRequest
 | S1 预扫描/规划 | `ParsedImage`、`ImageLayout`、`PlannedArtifact<R>` | `ImageLoader` | Phase 0 |
 | S2 reserve | `ImageAllocation`、`ReservedImage<R>` | `ImageLoader`/`ImageMemory` | Phase 0 |
 | S3 copy/zero | `MappedImage` | `ImageLoader` | Phase 0 |
-| S4 runtime metadata | `RuntimeImageMetadata`、`RuntimeImage` | `ImageLoader` | Phase 0.5；static PIE 子集在 Phase 0 |
+| S4 runtime metadata | `RuntimeImageMetadata`、`RuntimeImage` | `ImageLoader` | Phase 0.5；自包含单映像 relative 子集在 Phase 0 |
 | S5 依赖发现 | `DependencyGraph`、闭合的 `BuildingSession` | `DynamicLinker` | Phase 0.5 |
 | S6 scope | `ScopeSet`、`ScopedSession` | `DynamicLinker` | Phase 0.5 |
 | S7 relocation | `RelocatedImage`、`RelocatedSession` | `DynamicLinker`/`ArchRelocator` | Phase 0 relative 子集；Phase 0.5 完整 MVP |
@@ -1782,24 +1785,26 @@ Flash/XIP 是硬边界：调用指令若位于运行期不可写 Flash，loader 
 #### 阶段类型交付
 
 - 覆盖 S0–S3，交付 `AdmittedArtifact → PlannedArtifact → ReservedImage → MappedImage` 完整转换。
-- 交付 S4 的 static PIE 子集：`RuntimeImageMetadata` 至少保存 relative relocation 表。
-- 交付 S7/S8 的单映像子集：`RuntimeImage → RelocatedImage → SealedImage`；不建立依赖图和符号 scope。
+- 交付 S4 的自包含 `ET_DYN` 子集：`RuntimeImageMetadata` 至少保存已归一化的 REL/RELA relative relocation 表；RELR 只识别并按 profile 明确拒绝，不能宣称已实现 decoder。
+- 交付 S7/S8 的单映像子集：`RuntimeImage → RelocatedImage → PreparedImage`；`PreparedImage` 同时持有 sealed payload 与唯一 rollback authority，不建立依赖图和符号 scope。
+- 本地发布采用 `PreparedImage → ReadyImageCommit → committed owner`：prepare/install 可以失败，commit 只能 move/swap 且不返回 `Result`；兼容 mapper 由 installed state 接管 lease，不能再把无权 receipt 当作 owner。
 - `load_elf()` 只作为兼容包装，内部必须走上述阶段类型，不能保留第二套 parse/map/relocate 实现。
-- 对应建议提交 `C01`–`C10`。
+- 对应 Phase 0 本地提交 `P0-C00`–`P0-C15`。
 
 #### 主要工作
 
-1. 引入 `TargetAddr/TargetRange/LoadError/LoadLimits`。
-2. 实现 `SliceElfReader` 和 `ElfReader`。
+1. 引入 `TargetAddr/TargetRange/LoadError/LoadLimits`，底层 range/address 错误保持 stage-neutral，由阶段调用方补充 `LoadStage`。
+2. 实现 `SliceElfReader` 和带不可变快照契约的 `ElfReader`。
 3. 将 goblin 借用型结果转换成自有 `ParsedImage`，不在 `LoadedImage` 中保存 `Elf<'a>`。
-4. 实现 `ImageLayoutBuilder`。
-5. 修正非零最低 vaddr 的 load bias、BSS 显式清零、segment gap、最大 `p_align`、entry X 权限和 checked arithmetic。
-6. 实现 `ImageMemory` 和 `MemoryMapper` 兼容 adapter。
-7. 解析 REL/RELA/RELR 元数据；当前 static PIE 只执行允许的 relative relocation。
-8. 未知 relocation fail closed。
-9. 增加逻辑权限、RELRO hook 和 cache 接口。
-10. `load_elf()` 改为调用 `ImageLoader`。
-11. 保留 ET_EXEC fixed mapper 测试。
+4. 在 allocation 前完成 ELF class/endian/machine、ARM/RISC-V `e_flags`、Thumb entry mode、program/dynamic feature policy、资源预算和 `ImageLayoutBuilder` 校验。
+5. 修正非零最低 vaddr 的 load bias、BSS 显式清零、segment gap、最大 `p_align`、entry X 权限、规范 `R/RX/RW` 权限和 checked arithmetic。
+6. 实现 `ImageMemory`、非 `Copy` 的 `AllocationLease` 和 `MemoryMapper` 兼容 adapter；backend 对外只暴露精确逻辑范围，物理 padding 不得成为可写映像范围。
+7. 区分 owned 与 borrowed fixed：owned 失败释放 lease；fixed 首次修改后的失败必须进入 `Poisoned`，除非 backend 提供真实 snapshot/A-B/原生事务，不能把 bookkeeping release 称为内容回滚。
+8. 解析 REL/RELA 元数据并显式拒绝未启用的 RELR；按白名单校验 dynamic tag 与 `DT_FLAGS/DT_FLAGS_1` bit。
+9. relocation 在首次写入前完成 operation byte budget、目标排序、duplicate/overlap、权限、对齐、目标字宽和 relative result owner 校验；未知 relocation fail closed。
+10. 先 prepare granule/MPU-slot/alias-aware protection 与 cache plan，再 batch apply；记录请求范围和实际 `AppliedProtection`，平台不能提供所声明的 cache scope 时失败。
+11. `load_elf()` 改为调用 `ImageLoader`，并在解除 rollback authority 前完成所有可失败的 mapper install 准备。
+12. 保留 ET_EXEC fixed mapper 测试，并明确 AArch64 等当前未接入架构是支持项还是范围缩减。
 
 #### 验收门禁
 
@@ -1814,10 +1819,14 @@ Flash/XIP 是硬边界：调用指令若位于运行期不可写 Flash，loader 
 - W+X
 - entry 不在 X segment
 - relocation 越界/未对齐
+- duplicate/overlap relocation target、映像外 relative result 和 operation/metadata 峰值预算超限
 - 未知 relocation
-- 任意步骤失败后 allocation 全部释放
+- reader 版本变化、错误 ABI flag/Thumb entry 和未知 dynamic flag bit
+- protection granule 冲突、MPU slot 不足、cache capability/scope 不足
+- owned 映像任意 pre-commit 故障均 exactly-once 释放；modified fixed 故障进入 `Poisoned`
+- commit 后不再调用可能失败的步骤，且只有持有 lease 的 committed owner 能公开 entry
 
-ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须通过；现有 RISC-V64 static PIE、ET_EXEC 和 QEMU 测试作为兼容回归也必须继续通过，但不再决定 Phase 1 的首发架构。
+ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须证明真实 relocation 被消费；现有 RISC-V64 自包含 `ET_DYN`、ET_EXEC 和 QEMU 测试作为兼容回归也必须继续通过，但不再决定 Phase 1 的首发架构。Phase 0 的 fuzz target/corpus、逐调用 fault injection 和真实 QEMU oracle 全部属于合入门，不能只列为后续建议。
 
 ### 12.2 Phase 0.5：冻结 `DynamicLinker` 架构
 
@@ -2097,12 +2106,12 @@ process/
 
 ## 13. 推荐的实际提交顺序
 
-这里的 `Cxx` 是跨仓库的逻辑合入序号，不表示要制造一个跨 repository 的原子 commit。每个变更仍提交到自己的 `kernel`、`librs`、`build` 或应用仓库；跨仓库升级使用“先增加兼容能力，后切换调用方，最后删除旧路径”的顺序。表格某行若同时涉及多个仓库，实际拆成 `Cxx-a/Cxx-b`，按 producer → consumer 顺序合入，但共用同一个阶段 gate。相邻的两个或三个同仓库 `Cxx` 可以组成一个 PR，表中的 gate 不应被压到最后一个巨型 PR 才验证。
+这里的 `P0-Cxx` 是 Phase 0 分支内序号；`C11` 以后的 `Cxx` 是跨仓库的逻辑合入序号，不表示要制造一个跨 repository 的原子 commit。每个变更仍提交到自己的 `kernel`、`librs`、`build` 或应用仓库；跨仓库升级使用“先增加兼容能力，后切换调用方，最后删除旧路径”的顺序。表格某行若同时涉及多个仓库，实际拆成 `Cxx-a/Cxx-b`，按 producer → consumer 顺序合入，但共用同一个阶段 gate。相邻的两个或三个同仓库 `Cxx` 可以组成一个 PR，表中的 gate 不应被压到最后一个巨型 PR 才验证。
 
 关键依赖关系为：
 
 ```text
-C01–C10 可信 ImageLoader
+P0-C00–P0-C15 可信 ImageLoader
       ↓
 C11–C17 DynamicLinker host 闭环
       ├──────────────┐
@@ -2119,20 +2128,14 @@ C20 start ABI → C21 Scrt1 ─┤
 
 ### 13.1 Phase 0：`ImageLoader` 提交序列
 
-| 提交 | 仓库/子树 | 实现的数据结构和方法 | 本提交必须通过的 gate |
-| --- | --- | --- | --- |
-| C01 `loader: add typed addresses and structured errors` | `kernel/loader` | `TargetAddr/TargetWord/TargetRange/ImageId/AllocationId/LoadError/LoadStage/LoadErrorKind/ErrorContext`；实现 checked add/sub、range contains/overlaps 和目标字宽 encode | 纯单元测试覆盖 32/64 位边界、signed addend、溢出和错误上下文；不改变现有 `load_elf()` 行为 |
-| C02 `loader: add read-at input and artifact admission` | `kernel/loader` | `ElfReader/SliceElfReader/ArtifactRequest/ArtifactIdentity/AdmittedArtifact/LoadLimits`；实现 `ImageLoader::admit` 和最小 `ArtifactPolicy` | 截断 header、错误 machine/class/endianness、超限文件确定失败；fake memory backend 调用次数为 0 |
-| C03 `loader: own parsed ELF metadata` | `kernel/loader` | `ParsedImage/ElfHeaderInfo/ProgramHeaderInfo/LoadSegmentInfo/DynamicInfo/TableRange`；实现 `ImageLoader::inspect`，把 goblin 借用结果复制为自有结构 | parser 临时缓冲在 `inspect` 后即可释放，reader handle 仅作为值继续传递；malformed phdr/dynamic range corpus 通过，无 `Elf<'a>` 进入长期对象 |
-| C04 `loader: plan image layout before allocation` | `kernel/loader` | `ImageLayout/SegmentLayout/PlannedArtifact/ImageLayoutBuilder`；实现 `build/allocation_request/load_bias_for/locate_vaddr_range` | 非零最低 vaddr、segment gap、最大 `p_align`、重叠权限、W+X、非 X entry 和所有算术溢出测试 |
-| C05 `loader: reserve images through ImageMemory` | `kernel/loader` | `ImageMemory/AllocationRequest/ImageAllocation/ReservedImage/TargetLocation`，以及 `MemoryMapper` adapter；实现 `reserve/target_base/release` | fake backend 返回错误 base/长度/对齐时失败并释放；现有 mapper 仍可编译 |
-| C06 `loader: copy segments and zero bss` | `kernel/loader` | `LoadedImageData/LoadedRegion/MappedState/MappedImage`；实现 `copy_and_zero/target_addr/locate` | 在预填充 `0xa5` 的内存上验证 BSS/gap；逐 read/write 故障注入无 allocation 泄漏 |
-| C07 `loader: normalize runtime ELF metadata` | `kernel/loader` | `RuntimeImageMetadata/RuntimeDynamicInfo/RelocationTables/ImageLifecycleMetadata/RuntimeMetadataState`；实现 `MappedImage::decode_runtime` 和 REL/RELA/RELR table decoder | 所有 runtime table 必须落在 R region；init/fini array 此时只校验 range、不读取未重定位指针；首版拒绝项返回 `UnsupportedByProfile` |
-| C08 `loader: apply ARM32 relative relocations and fail closed` | `kernel/loader` | `RelocationRecord/RelocationRequest/RelocationEngine` 与 ARM32 `R_ARM_RELATIVE`；实现 REL addend 的有界读取、保留通用 RELA decoder、`RuntimeImage::into_relocated` | ELF32/小端 golden fixture 精确比较写值；越界、未对齐、32 位溢出和未知 relocation 均失败并回滚 |
-| C09 `loader: seal permissions and synchronize code cache` | `kernel/loader` | `CodeCache/SealPlan/ProtectionRange/AppliedProtection/RelocatedImage/SealedImage`；实现 `build_seal_plan/protect/sync_instruction_cache/seal` | 验证 RELRO 和最终逻辑权限顺序；cache 未实现时失败；无硬件保护只返回 `LogicalOnly` |
-| C10 `loader: route load_elf through ImageLoader` | `kernel/loader` | 将 `load_static_pie/load_fixed_exec` 组合为新阶段转换；旧 `load_elf()` 只保留参数兼容包装 | ARM32 relative host fixture 和现有 RISC-V64 static PIE、ET_EXEC、QEMU 回归全部通过；删除或禁止旧的第二套 relocation 路径 |
+Phase 0 的 commit hash、逐提交动机和测试明细不在此处重复维护，以 [Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为唯一清单：
 
-C10 是 Phase 0 的合入门。此时还没有 `DT_NEEDED`，但 S0–S4、relative S7 和 S8 已经由真实类型边界串起来。
+- `P0-C00`–`P0-C12` 是已实现的可运行基线；它们不等于事务和平台能力已经收口。
+- `P0-C13` 收紧 allocation lease、prepared/committed owner、两段式 install 与 fixed poisoned 语义。
+- `P0-C14` 收紧 source snapshot、ABI/policy、资源预算与 relocation plan。
+- `P0-C15` 落地 prepared protection/cache plan、逐范围 applied result、fault/fuzz/QEMU 门禁。
+
+`P0-C15` 才是 Phase 0 的合入门。此时还没有 `DT_NEEDED`，但 S0–S4、relative S7 和 S8 已经由真实类型边界串起来，且 local commit 后不存在可失败步骤。
 
 ### 13.2 Phase 0.5：`DynamicLinker` 提交序列
 

@@ -1153,19 +1153,20 @@ SONAME major 表示不兼容 ABI；同 major 内遵循 append-only 导出、已�
 
 > 每一阶段都以可验证的 gate 收口；运行期 `dlopen/dlclose` 在 Phase 3 交付，不是 Phase 1 启动动态链接 MVP 的门槛。可编辑源文件：[implementation-roadmap.drawio](./assets/dynamic-loading/implementation-roadmap.drawio)。
 
-#### 7.4.1 Phase 0：把当前 static PIE loader 变成可信基线
+#### 7.4.1 Phase 0：把当前单映像 loader 变成可信基线
 
 目标不是动态链接，而是先得到正确、安全、可复用的装载机制。
 
-- 完整 ELF/program-header 校验与资源上限；
+- 带不可变快照契约的 read-at 输入、完整 ELF/program-header/架构 ABI 校验与板级资源上限；
 - 正确 load bias、逐段布局、显式 BSS 清零、checked arithmetic；
-- 保留现有 `R_RISCV_RELATIVE` 兼容回归，并以 ARM32 `R_ARM_RELATIVE` 打通 `DT_REL` 隐式 addend；补齐通用 REL/RELA/RELR parser 基础；
-- 权限元数据、W^X、RELRO hook、cache sync；
+- 保留现有 `R_RISCV_RELATIVE` 兼容回归，并以 ARM32 `R_ARM_RELATIVE` 打通 `DT_REL` 隐式 addend；归一化 REL/RELA，RELR 在 profile 未启用时只识别并明确拒绝；
+- dynamic tag/flag 白名单、relocation 目标/结果/重复写入校验和峰值内存预算；
+- granule-aware 权限计划、W^X、RELRO、逐范围实际 protection 结果和具有板级 capability/scope 的 cache sync；
 - 用 `ElfReader/ReadAt` 替代整文件读入；
-- `ThreadGroup`/`LoadedImage`/事务回滚模型；
-- 畸形 ELF corpus 和 fuzz target。
+- 用 `AllocationLease + PreparedImage + committed owner` 建立单映像事务所有权；owned 映像支持强回滚，borrowed fixed 修改后失败进入 `Poisoned`；Phase 0 不引入 `ThreadGroup`；
+- 畸形 ELF corpus、逐调用 fault injection 和 fuzz target。
 
-验收：非零最低 `p_vaddr`、带洞 segment、大 BSS、错误 `p_align`、越界/溢出、未知 relocation、非 X entry、故意 W+X 都有确定结果；ARM32 relative host fixture 通过，现有 RISC-V64 QEMU static PIE 继续稳定运行。
+验收：非零最低 `p_vaddr`、带洞 segment、大 BSS、错误 `p_align`、越界/溢出、未知 relocation、非 X entry、故意 W+X、错误 ABI flag、重复 relocation、权限粒度冲突和事务中每个故障点都有确定结果；ARM32 fixture 必须证明真实 relative relocation 被消费，现有 RISC-V64 QEMU 自包含 `ET_DYN` 继续稳定运行，并保证 local commit 后不存在可失败步骤。详细 gate 以 [Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为准。
 
 #### 7.4.2 Phase 0.5：扩充 `blueos_loader` 并冻结 DynamicLinker 架构
 
