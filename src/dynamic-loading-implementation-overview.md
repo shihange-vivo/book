@@ -115,7 +115,7 @@ kernel/loader/src/
 | `reader.rs` | `ElfReader` | 提供与 VFS、内存切片或用户态文件无关的按偏移读取接口 |
 | `memory.rs` | `ImageMemory`、`CodeCache` | 抽象目标内存分配、复制、清零、权限、回收和指令缓存同步 |
 | `error.rs` | `LoadError`、`LoadStage` | 记录失败阶段及 ELF、符号、重定位和底层错误上下文 |
-| `image/` | `ImageLoader`、`ParsedImage`、`ImageLayout`、`LoadedImage` | 完成单 ELF 解析、校验、布局、映射和基础重定位 |
+| `image/` | `ImageLoader`、`ParsedImage`、`ImageLayout`、`StagedImage` | 完成单 ELF 解析、校验、布局、映射和基础重定位，并把 state payload 与 rollback authority 绑定 |
 | `relocation/` | `ArchRelocator`、`RelocationKind` | 提供各架构唯一的 REL/RELA/RELR 解码、计算和写入实现 |
 | `dynamic_linker/` | `DynamicLinker`、`LinkSession`、`LinkContext`、`DependencyGraph`、`SymbolScope`、`LinkProduct`、`InitPlan`、`FiniPlan`、`LoadMetrics` | 组合多个 image，完成依赖闭包、符号绑定、事务回滚、发布、生命周期计划和通用指标采集 |
 
@@ -234,7 +234,7 @@ main(argc, argv, envp)
 | 控制点 | 现阶段策略 | 边界 |
 | --- | --- | --- |
 | 工件准入 | 内置/allowlist，产品阶段签名、hash、manifest、ABI note、artifact generation；分配前完成资源上限检查 | 证明来源和兼容性，不证明代码无恶意 |
-| ELF/布局 | checked arithmetic；校验 file/vaddr/alignment/overlap/entry；拒绝 W+X、TEXTREL、可执行栈和未支持特性 | 防止畸形 ELF 借 loader 越界读写 |
+| ELF/布局 | checked arithmetic；校验 file/vaddr/alignment/overlap，并要求 canonical entry 的最小指令跨度完整位于 X segment；拒绝 W+X、TEXTREL、可执行栈和未支持特性 | 防止畸形 ELF 借 loader 越界读写 |
 | 依赖/符号 | 固定 resolver，SONAME+文件身份去重，application/system scope 分离，不导出完整内核符号表 | 防止私有 DSO 冒充 system DSO 和应用 interpose libc relocation |
 | relocation | `P` 必须属于当前 owner 的允许写入区；`S` 必须来自冻结 scope；类型、宽度、对齐、addend 和溢出全部校验 | `JUMP_SLOT`、entry、init/fini 目标必须在允许 X region，undefined weak=0 只能由 profile 显式放行；只覆盖 relocation-backed 控制流，不是完整 CFI |
 | 权限/cache | S9 前映像不可见；写完后形成 RX/R/RW+NX，RELRO 去 W，cache 同步后才 publish | 无硬件后端时只能记录 `LogicalOnly`，不能宣传为硬件防护 |

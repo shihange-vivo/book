@@ -35,7 +35,7 @@ P0-C00–P0-C12 的验证覆盖 52 个 host tests，以及 RISC-V64 `ET_DYN`、A
 以下问题必须在进入 Phase 0.5 前关闭：
 
 1. `load_image()` 当前先执行 `commit_for()`，兼容包装随后才调用可失败的 `install_sealed()`。这使 entry 安装失败发生在 rollback authority 已解除之后，违反“commit 后不再失败”。
-2. `ImageLoadTransaction` 与 staged image 是两个独立参数，`commit_for()` 只比较 `AllocationId`；来自另一个 backend/transaction 的同号 allocation 可能被错误提交。成功后 `SealedImage` 也只保存 allocation 描述，不持有资源 lease，entry 的存活所有者不明确。
+2. `ImageLoadTransaction` 与 staged image 是两个独立参数，`commit_for()` 只比较 `AllocationId`；来自另一个 backend/transaction 的同号 allocation 可能被错误提交。成功后的旧 sealed payload 也只保存 allocation 描述，不持有资源 lease，entry 的存活所有者不明确。
 3. owned `ET_DYN` 失败时可以通过释放 allocation 实现强回滚；borrowed fixed `ET_EXEC` 一旦开始写入或修改权限就不能靠 `release()` 恢复旧内容。两者不能继续使用同一句“事务回滚”描述。
 4. `RuntimeFeaturePolicy` 目前没有实际决策，`PT_INTERP/PT_TLS` 和 dynamic tag 的拒绝散落在 parser/decoder；`DT_FLAGS/DT_FLAGS_1` 也没有按 bit 白名单校验，Phase 0.5 无法只靠“放宽 policy”复用 parser。
 5. byte-range `SealPlan` 没有 protection granule、MPU region 数量或实际应用范围；逐 range `protect()` 可以部分成功。ARM backend 对所有 ARM 仅执行 DSB/ISB 就报告成功，无法区分无 cache 的 MPS2 与 cache-enabled Cortex-M；RISC-V `fence.i` 也只同步当前 hart。
@@ -87,7 +87,7 @@ BlueOS 不照搬 Relink 在 prepare 时预占 committed slot、commit 写入后�
 - relative relocation 的范围、owner、权限、字宽、端序、对齐和溢出校验；
 - 未知 relocation fail closed；
 - dynamic tag/flag 的显式白名单；
-- logical permissions、granule-aware protection plan、逐 range `AppliedProtection`、指令缓存同步和 seal；
+- logical permissions、granule-aware protection plan、逐 range `ProtectionRecord`、指令缓存同步和 seal；
 - pre-commit guard、成功后的 allocation lease/owner，以及 borrowed fixed 的 poisoned 失败状态；
 - `load_elf()` 兼容入口转调新管线；
 - host malformed/fault-injection tests 和现有 QEMU 回归。
@@ -96,6 +96,7 @@ BlueOS 不照搬 Relink 在 prepare 时预占 committed slot、commit 写入后�
 
 Phase 0 不实现：
 
+- AArch64 单映像 compatibility relocation/execution；`load_elf()` 在该 target 明确返回 unsupported，正式支持放到 Phase 2 的 `R_AARCH64_*`、页权限和 QEMU oracle 一并交付；
 - `DT_NEEDED` 和 DSO 依赖闭包；
 - dynsym、GNU/SysV hash 和符号查找；
 - `R_ARM_ABS32/R_ARM_GLOB_DAT/R_ARM_JUMP_SLOT`；
@@ -183,8 +184,8 @@ ElfReader
   → copy + zero      → MappedImage
   → decode runtime   → RuntimeImage
   → relocate         → RelocatedImage
-  → seal             → PreparedImage<SealedImage>（rollback 仍 armed）
-  → local commit     → CommittedImage / installed MemoryMapper owner
+  → seal             → PreparedImage<SealedState>（rollback 仍 armed）
+  → local commit     → M::CommitReceipt / installed MemoryMapper owner
 ```
 
 类型设计遵循以下规则：
@@ -192,7 +193,7 @@ ElfReader
 1. 阶段转换消费上一阶段对象并返回下一阶段对象；
 2. 阶段类型的字段和构造函数为 private 或 `pub(crate)`；
 3. 不提供公共 `set_state()`；
-4. `MappedImage/RuntimeImage/RelocatedImage` 不暴露 entry，pre-commit 的 `SealedImage::entry()` 只允许 publisher 在 crate 内部读取；
+4. `MappedImage/RuntimeImage/RelocatedImage` 不暴露 entry，pre-commit 的 `SealedState::entry()` 只允许受信 publisher 读取；
 5. `PreparedImage` 必须 `#[must_use]`，Drop 时仍拥有唯一 rollback authority；
 6. 值类型在第一次出现真实消费者时引入，不按终态类型表一次性创建。
 
@@ -348,6 +349,7 @@ pub struct ArtifactProfile {
     header_flags: HeaderFlagsPolicy,
     entry_mode: EntryMode,
     minimum_image_alignment: u64,
+    relative_values: RelativeValuePolicy,
 }
 
 pub struct HeaderFlagsPolicy {
@@ -355,8 +357,14 @@ pub struct HeaderFlagsPolicy {
 }
 
 pub enum EntryMode {
-    Direct { instruction_alignment: u8 },
-    Thumb { instruction_alignment: u8 },
+    Direct {
+        instruction_alignment: u8,
+        minimum_instruction_size: u8,
+    },
+    Thumb {
+        instruction_alignment: u8,
+        minimum_instruction_size: u8,
+    },
 }
 
 pub struct LoadLimits {
@@ -378,6 +386,8 @@ pub struct AdmittedArtifact<R> {
 }
 ```
 
+`ArtifactProfile::new()` 不提供架构相关默认值，必须显式接收 `HeaderFlagsPolicy`、`EntryMode`、最小 image alignment 和 `RelativeValuePolicy`；调用方不能只填 class/endian/machine 就得到一个宽松 profile。profile 构造后没有可逐项削弱命名 profile 的 `with_*` API；生产入口优先使用经过评审的命名 machine profile，不能用“通用 profile”隐式放行未知 ABI 位、退化 entry/alignment 约束或扩大 relative relocation 结果范围。
+
 这些类型的当前目的：
 
 - `ArtifactProfile`：描述 loader 能处理的目标 ELF ABI；
@@ -386,23 +396,23 @@ pub struct AdmittedArtifact<R> {
 - `LoadLimits`：让文件长度和 phdr 数量在 allocation 前受控；
 - `LoadError`：让测试和上层能够区分 read/parse/validate 错误。
 
-`LoadStage` 由执行阶段边界赋值。`TargetAddr/TargetRange/TargetLocation` 等底层算术不能把错误永久写成 `Validate` 或 `Map`，backend 也不能把所有访问失败都写成 `Map`；它们应返回 stage-neutral 的 `RangeError/BackendError`，由 metadata/relocate/cache/seal 调用点包装。否则同一溢出会因为复用 helper 而被错误归因，诊断和 fault-injection oracle 都不可信。
+`LoadStage` 由执行阶段边界赋值。`TargetAddr/TargetRange/TargetLocation` 等底层算术不能把错误永久写成 `Validate` 或 `Map`，backend 也不能把所有访问失败都写成 `Map`；它们应返回 stage-neutral 的 `RangeError/MemoryError`，由 metadata/relocate/cache/seal/publish 调用点包装。`ElfReader` 自身的原始错误属于 `Read`，但 S1 program-header 消费点和 S3 segment-copy 消费点必须分别重绑定为 `Parse`、`Map`。尤其 `prepare_install` 属于 `Publish`，不能继续借用 `Seal` 标签。否则同一溢出或 I/O 失败会因为复用 helper 而被错误归因，诊断和 fault-injection oracle 都不可信。
 
 `ArtifactProfile` 不能只比较 class/endian/machine：
 
-- ARM Thumb v7-M soft-float profile 至少校验 ARM EABI/float 相关 `e_flags`，要求 entry bit 0 为 1，并用清除 bit 0 后的地址做 X-range membership；
+- ARM Thumb v7-M soft-float profile 至少校验 ARM EABI/float 相关 `e_flags`，要求 entry bit 0 为 1，并用清除 bit 0 后的 canonical 地址及最小指令跨度做 X-range membership；
 - RISC-V profile 校验 float ABI、RVE/扩展能力与 entry 指令对齐；
 - 机器专用校验通过 profile/arch validator 完成，不把 ARM 常量散落到通用 parser；
 - BlueOS ABI note、签名和 build-id 仍属于 Phase 1 产品准入，不因本修订提前进入 Phase 0。
 
-`LoadLimits::default()` 只能用于 host fixture。兼容入口必须由 board/profile 提供限额；64 MiB image 和一百万条 relocation 不能作为 MCU 的生产默认值。后续在真实消费者出现时逐步增加 layout/metadata/operation 的峰值字节配额，而不是在 P0-C01 预建未使用字段。所有 `Vec → Box` 收缩也要确认不会引入未审计的隐式分配；不能证明时保留已 fallible reserve 的 `Vec`。
+`LoadLimits::default()` 只能用于 host fixture。兼容入口必须由 board/profile 提供限额；64 MiB image 和一百万条 relocation 不能作为 MCU 的生产默认值。后续在真实消费者出现时逐步增加 layout/metadata/operation 的峰值字节配额，而不是在 P0-C01 预建未使用字段。Phase 0 的可变长度 state payload 最终统一保留已经 `try_reserve*` 成功的 `Vec`；不能在其后调用可能隐式收缩分配的 `into_boxed_slice()`，尤其不能在映像字节已修改后引入无法返回 `LoadError` 的 OOM 点。
 
 不要在本提交引入路径、build-id、签名、`ExecutionModel`、`LinkDomainId` 或 `ImageId`。它们在单映像 Phase 0 中没有消费者。
 
 ### 5.4 测试与 Gate
 
 - 空文件、截断 header、短读；
-- 错误 class/endian/machine/type；
+- 错误 class/endian/machine/type，以及 System V 下非零 `EI_ABIVERSION`；
 - 错误 `e_flags`、ARM even entry、错误指令对齐；
 - `e_phoff + e_phnum * e_phentsize` 溢出或越界；
 - 文件长度和 phdr 数量超限；
@@ -480,7 +490,7 @@ pub struct DynamicSegmentInfo {
 
 pub struct ParsedImage {
     header: ElfHeaderInfo,
-    load_segments: Box<[LoadSegmentInfo]>,
+    load_segments: Vec<LoadSegmentInfo>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack_policy: StackPolicy,
@@ -488,9 +498,9 @@ pub struct ParsedImage {
 }
 
 pub struct ProgramFeatureSummary {
-    interp: Option<FileRange>,
-    tls: Option<TargetRange>,
-    stack_policy: StackPolicy,
+    interpreter: Option<(u16, FileRange)>,
+    tls: Option<(u16, TargetRange)>,
+    executable_stack: Option<u16>,
 }
 ```
 
@@ -518,7 +528,7 @@ impl TargetRange {
 }
 ```
 
-`inspect()` 先保持 `pub(crate)`；P0-C03 的 `plan()` 才形成调用方可使用的完整阶段边界。
+`inspect()` 可以作为只读的结构解析边界公开，但不能分配目标内存或产生可变 target access；P0-C03 的 `plan()` 才形成可进入 reserve 的完整阶段证明。
 
 ### 6.4 测试与 Gate
 
@@ -565,7 +575,7 @@ src/image/layout.rs
 9. 按 vaddr 排序；Phase 0 拒绝任何非空 overlap；
 10. 计算所有 segment 的 `max_align` 并满足 profile 的最小映像对齐；allocation backend 可以使用更高物理对齐，但必须返回满足请求的逻辑 base，并隐藏额外 padding；
 11. 计算 `aligned_min_vaddr/aligned_max_vaddr/image_span`；
-12. entry 必须满足架构编码/指令对齐并落在真实 X segment，不能只位于 allocation 包络或 gap 中。
+12. entry 必须满足架构编码/指令对齐，且从 canonical entry 开始的最小指令跨度完整落在真实 X segment，不能只让首字节位于 allocation 包络或 segment 尾部。
 
 ARM32 entry 需要区分：
 
@@ -576,8 +586,10 @@ ARM32 entry 需要区分：
 
 ```rust
 pub struct SegmentLayout {
+    source_index: u16,
     vaddr_range: TargetRange,
     file_range: FileRange,
+    align: u64,
     permissions: MemoryPermissions,
 }
 
@@ -587,7 +599,8 @@ pub struct ImageLayout {
     image_span: u64,
     max_align: u64,
     entry_vaddr: TargetAddr,
-    segments: Box<[SegmentLayout]>,
+    canonical_entry_vaddr: TargetAddr,
+    segments: Vec<SegmentLayout>,
     relro: Option<TargetRange>,
 }
 
@@ -668,7 +681,7 @@ Exec:
 - 非法 align 或 offset/vaddr 不同余；
 - file/vaddr/span 溢出；
 - W+X 和 overlap；
-- entry 位于 gap、只读 segment 或映像外；
+- entry 位于 gap、只读 segment、映像外，或最小指令跨度越过 X segment 尾部；
 - ARM Thumb entry membership；
 - allocator 调用次数仍为零。
 
@@ -714,8 +727,26 @@ pub trait ImageMemory {
         &mut self,
         allocation: AllocationLease,
     );
+
+    // 可被 Map/Metadata/Relocate/Seal 复用，backend 不得预写死阶段。
+    fn read(...) -> MemoryResult<()>;
+    fn write(...) -> MemoryResult<()>;
+    fn zero(...) -> MemoryResult<()>;
+    fn validate_access(...) -> MemoryResult<()>;
+    fn protect(...) -> MemoryResult<ProtectionLevel>;
+}
+
+pub struct MemoryError {
+    kind: LoadErrorKind,
+    context: ErrorContext,
+}
+
+impl MemoryError {
+    fn at(self, stage: LoadStage) -> LoadError;
 }
 ```
+
+allocation/prepare/publish 等天然只属于单一阶段的接口继续返回 `LoadResult`；目标内存 access backend 返回无阶段的 `MemoryError`，由 Map、Metadata、Relocate 或 Seal 消费点显式调用 `at(stage)`。这样新增 dynamic/symbol decoder 时不会继承兼容 mapper 的默认错误阶段。
 
 实现 `MemoryMapper` compatibility adapter：
 
@@ -861,13 +892,13 @@ fn write(
     &mut self,
     location: TargetLocation,
     data: &[u8],
-) -> LoadResult<()>;
+) -> MemoryResult<()>;
 
 fn zero(
     &mut self,
     location: TargetLocation,
     len: u64,
-) -> LoadResult<()>;
+) -> MemoryResult<()>;
 ```
 
 复制规则：
@@ -900,11 +931,10 @@ pub struct LoadedRegion {
 pub struct MappedState {
     request: ArtifactRequest,
     allocation: ImageAllocation,
-    image_span: u64,
     load_bias: TargetAddr,
     entry: TargetAddr,
     canonical_entry: TargetAddr,
-    regions: Box<[LoadedRegion]>,
+    regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
 }
@@ -993,7 +1023,7 @@ fn read(
     &self,
     location: TargetLocation,
     dst: &mut [u8],
-) -> LoadResult<()>;
+) -> MemoryResult<()>;
 ```
 
 处理规则：
@@ -1040,7 +1070,7 @@ pub struct RelocationRecord {
 }
 
 pub struct RuntimeImageMetadata {
-    relocations: Box<[RelocationRecord]>,
+    relocations: Vec<RelocationRecord>,
     features: DynamicFeatureSummary,
 }
 
@@ -1167,7 +1197,6 @@ pub struct TargetWord {
 pub trait ArchRelocator {
     fn machine(&self) -> u16;
     fn class(&self) -> ElfClass;
-    fn word_width(&self) -> WordWidth;
     fn relative_type(&self) -> u32;
     fn addend_encoding(&self) -> AddendEncoding;
 }
@@ -1183,7 +1212,7 @@ pub type RelocatedImage<'a, M> =
     StagedImage<'a, M, RelocatedState>;
 ```
 
-`ArchRelocator` 只描述架构 ABI 差异；通用 engine 负责先生成全部 `RelocationOperation`，按 target range 排序并检查碰撞，预检完成后再写回。`RelocationRecord` 与 operation 的合计峰值必须进入 `max_runtime_metadata_bytes/max_relocation_operation_bytes`；若后续改成两遍扫描来降低 RAM，必须先证明 reader snapshot 稳定、REL addend 不会被第一遍后的写入改变，并拒绝重复 target。`TargetWord/WordWidth` 到本提交才有实际用途，因为此时第一次按目标 ELF 字宽和端序读写 relocation value。
+`ArchRelocator` 只描述架构 ABI 差异；目标字宽由已经准入的 `ElfClass` 唯一推导，不能让 relocator 再声明一份可能矛盾的 `word_width`。通用 engine 负责先生成全部 `RelocationOperation`，按 target range 排序并检查碰撞，预检完成后再写回。`RelocationRecord` 与 operation 的合计峰值必须进入 `max_runtime_metadata_bytes/max_relocation_operation_bytes`；若后续改成两遍扫描来降低 RAM，必须先证明 reader snapshot 稳定、REL addend 不会被第一遍后的写入改变，并拒绝重复 target。`TargetWord/WordWidth` 到本提交才有实际用途，因为此时第一次按目标 ELF 字宽和端序读写 relocation value。
 
 ### 11.4 测试与 Gate
 
@@ -1286,11 +1315,12 @@ relocation 完成只表示映像字节暂时正确。代码可执行前仍需要
 
 ```rust
 pub trait CodeCache {
+    // 发布环境要求；不属于 ELF artifact 准入属性。
+    fn requirements(&self) -> CacheRequirements;
+
     fn prepare(
         &self,
-        allocation: &ImageAllocation,
         executable_ranges: &[TargetRange],
-        scope: ExecutionScope,
     ) -> LoadResult<PreparedCacheSync>;
 
     fn synchronize(
@@ -1299,21 +1329,28 @@ pub trait CodeCache {
     ) -> LoadResult<CacheSyncOutcome>;
 }
 
-pub trait ImageMemory {
-    // 前置阶段：无可见副作用，检查 granule、region 数量、alias 和全部 range。
-    fn prepare_protection(
+pub trait ImageProtectionMemory: ImageMemory {
+    // backend 只报告能力；core 据此构造不可伪造的 PreparedProtectionPlan。
+    fn protection_capabilities(&self) -> ProtectionCapabilities;
+
+    // 前置阶段：无可见副作用，检查 backend-specific writable alias。
+    fn validate_protection_aliases(
         &self,
         allocation: &ImageAllocation,
-        logical: &SealPlan,
-    ) -> LoadResult<PreparedProtectionPlan>;
+        prepared: &PreparedProtectionPlan,
+    ) -> LoadResult<()>;
 
-    // prepared 已持有结果存储；apply 中不得再为 metadata 分配内存。
+    // core 从 prepared 取出固定长度的结果槽并包装为不可改集合的 capability；
+    // backend 只能读取请求并按 index 原位记录 level，
+    // 不能另造、遗漏或增加结果记录，apply 中也不得为 metadata 分配内存。
     fn apply_protection(
         &mut self,
-        prepared: PreparedProtectionPlan,
-    ) -> LoadResult<AppliedProtectionSet>;
+        batch: ProtectionBatch<'_>,
+    ) -> LoadResult<()>;
 }
 ```
+
+`PreparedProtectionPlan::prepare()` 是 crate-private core 路径：它根据 capability 完成 granule/region 数量编译，调用 alias preflight，并逐项执行 target access 校验。它不能作为带默认实现的 backend trait 方法，否则实现方可以覆盖核心计划生成，而外部实现又无法合法构造 opaque plan，接口契约会前后矛盾。
 
 `SealPlan` 固定形成：
 
@@ -1339,14 +1376,16 @@ backend prepared plan 还必须满足：
   → prepare 全部 protection 和 cache capability（仍无副作用）
   → 一次同步全部新写入的 executable range
   → apply prepared protection batch
-  → 形成 SealedImage
+  → 形成 SealedState
 ```
+
+`PreparedCacheSync` 除 scope/maintenance capability 外，必须原样保存调用方给出的全部 executable ranges；seal 在执行同步前逐项核对，不能接受遗漏、替换或扩大的 backend token。同步返回的 `CacheSyncOutcome` 还必须与已验证 token 的 ranges、scope 和 maintenance 完全一致，backend 不能在副作用完成后改报结果。`CacheRequirements` 在 prepare 前只读取一次并固定，属于 cache/publisher adapter，因此 Phase 0.5 的 `LinkSession` 可以对整批映像共享同一发布要求，而 `ArtifactRequest` 继续只描述 ELF、ABI 和资源上限。
 
 cache backend 由 board/arch adapter 提供，不能仅凭 `target_arch` 假定硬件状态：
 
 - 无 cache/关闭 cache 的 ARMv7-M：明确 capability 后执行 DSB/ISB；cache-enabled 板还需逐 line clean D-cache 到 PoU、invalidate I-cache 到 PoU 和正确 barrier；
 - RISC-V：当前 hart 执行 `fence.i`；SMP 下必须广播/逐 hart 同步，或由 policy 保证提交后仅同步过的 hart 可执行；
-- AArch64：若现有 loader 测试继续执行动态写入代码，则实现正确的 D-cache clean/I-cache invalidate；
+- AArch64：Phase 0 不提供单映像 relocation/execution；保留的通用 cache primitive 使用正确的 D-cache clean/I-cache invalidate，不能被解释为 compatibility loader 已受支持；
 - x86 host：可以报告架构指令缓存一致性，但不能把通用空 stub 当作所有架构实现。
 
 如果 Phase 0 暂不支持某个既有架构（例如当前分支没有 AArch64 `load_elf`），必须在范围和 CI matrix 中显式写明；不能用通用 unsupported stub 同时声称“现有架构不回退”。
@@ -1355,7 +1394,7 @@ cache backend 由 board/arch adapter 提供，不能仅凭 `target_arch` 假定�
 
 ```rust
 pub struct SealPlan {
-    ranges: Box<[SealRange]>,
+    ranges: Vec<SealRange>,
 }
 
 pub enum ProtectionLevel {
@@ -1369,24 +1408,24 @@ pub struct SealRange {
     permissions: MemoryPermissions,
 }
 
-pub struct AppliedProtection {
+pub struct ProtectionRecord {
+    location: TargetLocation,
     requested_range: TargetRange,
     applied_range: TargetRange,
-    requested: MemoryPermissions,
-    applied: MemoryPermissions,
+    permissions: MemoryPermissions,
     level: ProtectionLevel,
 }
 
 pub struct AppliedProtectionSet {
-    ranges: Box<[AppliedProtection]>,
+    ranges: Vec<ProtectionRecord>,
 }
 
 pub enum ExecutionScope {
-    CurrentHart,
+    CurrentExecutionContext,
     AllExecutionContexts,
 }
 
-pub struct SealedImage {
+pub struct SealedState {
     mapped: MappedState,
     metadata: RuntimeImageMetadata,
     seal_plan: SealPlan,
@@ -1395,11 +1434,13 @@ pub struct SealedImage {
 }
 ```
 
-`SealedImage` 是只证明 relocation、cache 和 protection 已完成的 state payload，仍处于 unpublished 状态。它沿用 reserve 时建立的同一个 guard：
+`ProtectionRecord` 是 prepared plan 预先分配的中性记录槽；apply 前 enforcement 保守为 `LogicalOnly`，core 始终持有这份固定长度存储，并通过 `ProtectionBatch` 只开放只读请求和按 index 写 level 的能力。backend 不能改写/交换记录，也不能返回另一份集合，因此无法漏报、增报范围或在权限副作用开始后再次分配。`PreparedProtectionPlan` 与 `AppliedProtectionSet` 负责表达同一批记录所处的阶段。
+
+`SealedState` 是只证明 relocation、cache 和 protection 已完成的 state payload，仍处于 unpublished 状态。它沿用 reserve 时建立的同一个 guard：
 
 ```rust
 pub type PreparedImage<'a, M> =
-    StagedImage<'a, M, SealedImage>;
+    StagedImage<'a, M, SealedState>;
 ```
 
 不要暴露 `transaction.commit_for(&arbitrary_sealed)`。只有 `RelocatedImage::seal(self, cache)` 能形成 `PreparedImage`，所以 payload 与 rollback authority 从 reserve 起就没有分离过；Drop 自动 abort。成功路径把非 `Copy` 的 `AllocationLease` 移交给 committed owner 后才解除 guard。
@@ -1407,12 +1448,16 @@ pub type PreparedImage<'a, M> =
 pre-commit 的 entry 只供 crate 内部 publisher 校验：
 
 ```rust
-impl SealedImage {
-    pub(crate) fn entry(&self) -> TargetAddr;
+impl SealedState {
+    pub fn entry(&self) -> TargetAddr;
+    pub fn canonical_entry(&self) -> TargetAddr;
+    pub fn entry_instruction_span(&self) -> u64;
     pub fn seal_plan(&self) -> &SealPlan;
     pub fn protections(&self) -> &AppliedProtectionSet;
 }
 ```
+
+`PreparedImage` 不公开取得 state payload 的 accessor，因此普通调用方不能从 staged image 读取 entry；公共 `SealedState::entry()` 是给实现 `ImageCommitMemory` 的受信 publisher 在 `prepare_install()` 回调中校验并预构造 installed state 使用。
 
 `MappedImage/RuntimeImage/RelocatedImage` 不提供同名方法；公共 entry 由成功接管 lease 的 committed owner 提供。
 
@@ -1422,9 +1467,9 @@ impl SealedImage {
 - RELRO 覆盖 RW 子区间；
 - 相邻范围合并；
 - 页/MPU granule 舍入后的权限冲突、region 数量不足和 writable alias 在 apply 前失败；
-- cache 同步一次覆盖全部 X region，并记录 CurrentHart/SystemWide scope；
+- cache 同步一次覆盖全部 X region，并记录 CurrentExecutionContext/AllExecutionContexts scope；
 - cache/protect 任一步失败时 owned abort，modified fixed poisoned；
-- 逐 range 保存 requested/applied range、permission 和 `ProtectionLevel`；
+- 逐 range 保存 requested/applied range、唯一的目标 permission 和 `ProtectionLevel`；`HardwareEnforced` 表示 backend 精确落实了该 permission，不能用一份始终等于 requested 的冗余 “applied permission” 冒充后端证据；
 - 无硬件保护时逐 range 明确返回 `LogicalOnly`；
 - 没有可靠 cache backend 时加载失败；
 - cache-enabled ARM 不能用 barrier-only backend 通过，RISC-V SMP 不能把 local `fence.i` 报告为 system-wide；
@@ -1445,36 +1490,36 @@ P0-C01–P0-C09 已经分别证明读取、解析、布局、分配、复制、r
 ### 14.2 新高层 API
 
 ```rust
-pub fn prepare_image<'m, R, M, C, A, P>(
+pub fn prepare_image<'m, R, M, C, A>(
     reader: R,
     request: ArtifactRequest,
     memory: &'m mut M,
     cache: &mut C,
-    policy: &P,
     relocator: &A,
 ) -> LoadResult<PreparedImage<'m, M>>
 where
     R: ElfReader,
-    M: ImageMemory,
+    M: ImageProtectionMemory,
     C: CodeCache,
-    A: ArchRelocator + ?Sized,
-    P: ArtifactFeaturePolicy + ?Sized;
+    A: ArchRelocator + ?Sized;
 ```
 
 内部只负责编排到 sealed-but-uncommitted：
 
 ```rust
 let admitted = loader.admit(reader, request)?;
-let planned = loader.plan(admitted, policy)?;
+let planned = loader.plan(admitted)?; // 固定 Phase0ArtifactPolicy
 
-let reserved = loader.reserve(planned, memory)?;
+let reserved = loader.reserve_staged(planned, memory)?;
 let mapped = reserved.copy_and_zero()?;
-let runtime = mapped.decode_runtime(policy)?;
+let runtime = mapped.decode_runtime(&Phase0ArtifactPolicy)?;
 let relocated = runtime.relocate(relocator)?;
 let prepared = relocated.seal(cache)?;
 
 Ok(prepared)
 ```
+
+顶层 `prepare_image/load_image` 是 Phase 0 的可信单映像入口，必须固定使用 `Phase0ArtifactPolicy`；不能因为调用方传入一个更宽松的 policy，就把带 `DT_NEEDED`、TLS 或生命周期要求但尚未完成链接的映像提交。`ArtifactFeaturePolicy` 扩展点只保留在 `plan_with_policy()`、`decode_runtime()` 等未发布阶段，Phase 0.5 由 `LinkSession` 吸收 state 后使用。
 
 提交使用两段式协议：
 
@@ -1483,26 +1528,26 @@ PreparedImage::prepare_commit(self) -> LoadResult<ReadyImageCommit>
 ReadyImageCommit::commit(self) -> CommitReceipt      // 不返回 Result，不再分配
 ```
 
-`PreparedImage` 已经通过 transaction 独占借用同一个 memory backend，因此 `prepare_commit()` 不能再接收一个可能相同、也可能不同的独立 target 参数。P0-C13 在 `ImageMemory`（或其私有 supertrait）上增加 `prepare_install()`/`commit_install()`：前者通过 transaction 内部的 backend 校验 allocation 身份、entry、owner 容量和所有将要安装的字段，但不改变可见状态；后者只把预构造状态 move/swap 给 owner、转移 `AllocationLease` 并解除 rollback。`ReadyImageCommit` 和 `PreparedImage` 一样必须 `#[must_use]`，未 commit 的 Drop 仍触发 abort。
+`PreparedImage` 已经通过 transaction 独占借用同一个 memory backend，因此 `prepare_commit()` 不能再接收一个可能相同、也可能不同的独立 target 参数。P0-C13 在 `ImageCommitMemory: ImageProtectionMemory` 上增加 `prepare_install()`/`commit_install()`：前者通过 transaction 内部的 backend 校验 allocation 身份、entry、owner 容量和所有将要安装的字段，但不改变可见状态；后者只把预构造状态 move/swap 给 owner、转移 `AllocationLease` 并解除 rollback。`ReadyImageCommit` 和 `PreparedImage` 一样必须 `#[must_use]`，未 commit 的 Drop 仍触发 abort。
 
 建议接口骨架：
 
 ```rust
-pub(crate) trait ImageCommitMemory: ImageMemory {
+pub trait ImageCommitMemory: ImageProtectionMemory {
     type PreparedInstall;
     type CommitReceipt;
 
     fn prepare_install(
         &mut self,
         allocation: &ImageAllocation,
-        sealed: &SealedImage,
+        sealed: &SealedState,
     ) -> LoadResult<Self::PreparedInstall>;
 
     // 契约：不分配、不验证、不 panic、不返回 Result；只安装预构造状态并转移 lease。
-    fn commit_install(
+    unsafe fn commit_install(
         &mut self,
         prepared: Self::PreparedInstall,
-        sealed: SealedImage,
+        sealed: SealedState,
         lease: AllocationLease,
     ) -> Self::CommitReceipt;
 }
@@ -1510,16 +1555,16 @@ pub(crate) trait ImageCommitMemory: ImageMemory {
 #[must_use = "ready commit still owns rollback authority"]
 pub struct ReadyImageCommit<'a, M: ImageCommitMemory> {
     transaction: ImageLoadTransaction<'a, M>,
-    sealed: SealedImage,
+    sealed: SealedState,
     install: M::PreparedInstall,
 }
 ```
 
 `ReadyImageCommit::commit(mut self)` 先从 `transaction.pending` 中 `take()` 唯一 lease，再通过同一 `transaction.memory` 调用 `commit_install()`；`pending` 变为 `None` 后 transaction Drop 不再 abort。不得提供接收外部 allocation、sealed payload 或 backend 的 commit overload。
 
-`commit_install()` 的返回值可以是持有 lease 的 `CommittedImage`，也可以是 backend 已接管 lease 后的无权 `CommitReceipt`；两种模式只能选择一种。兼容 `MemoryMapper` 采用后者：installed state 持有唯一 lease，receipt 不能公开 entry。若平台无法把安装实现为不可失败操作，就必须把其全部动作保留在 prepare 阶段并提供失败原子性，不能先 disarm 再返回错误。
+`commit_install()` 的返回值可以是持有 lease 的 `CommitReceipt`，也可以是 backend 已接管 lease 后的无权 `CommitReceipt`；backend 对自己的 receipt 只能选择一种所有权模式并写入契约。兼容 `MemoryMapper` 采用后者：installed state 持有唯一 lease，receipt 不能公开 entry。若平台无法把安装实现为不可失败操作，就必须把其全部动作保留在 prepare 阶段并提供失败原子性，不能先 disarm 再返回错误。
 
-`CommittedImage` 或 `MemoryMapper` installed state 是 allocation 的唯一成功 owner，保证 entry 使用期间 backend 和映射不被复用。Phase 0 可以不提供显式 unload，但必须定义 owner Drop：owned 调用 `release_committed()` 回收，borrowed fixed 只解除借用且不声称恢复旧内容；任何模式都不得按失败路径 poison 已成功提交的 fixed 映像。Phase 0.5 把同一 lease 转移到 `LinkContext`/`ReapResources`，不能把裸 `SealedImage` 当成生命周期 owner。
+持有 lease 的 `M::CommitReceipt` 或 backend 的 installed state 是 allocation 的唯一成功 owner，保证 entry 使用期间 backend 和映射不被复用。Phase 0 可以不提供显式 unload，但必须定义 owner Drop：owned 调用 `release_committed()` 回收，borrowed fixed 只解除借用且不声称恢复旧内容；任何模式都不得按失败路径 poison 已成功提交的 fixed 映像。Phase 0.5 把同一 lease 转移到 `LinkContext`/`ReapResources`，不能把裸 `SealedState` 当成生命周期 owner。
 
 ### 14.3 兼容入口
 
@@ -1576,7 +1621,7 @@ P0-C00–P0-C12 不改写历史；新增三个可独立审查的提交关闭评�
 | --- | --- | --- |
 | P0-C13 `loader: keep image rollback armed through local commit` | `AllocationLease`、单 allocation `Option` guard、从 reserve 起携带 guard 的 `StagedImage<S>`、`PreparedImage/ReadyImageCommit`、同 backend 两段式 install、fixed poisoned 状态；阶段低层接口收为 `pub(crate)` | publisher/prepare-install 每点故障仍 abort；commit 后无 `Result`；wrong-transaction 在安全主路径不可表达；owned exactly-once release；modified fixed 不可重试；entry 存活期 owner 持有 lease |
 | P0-C14 `loader: harden artifact and relocation policy` | snapshot reader 契约、ARM/RISC-V `e_flags`/entry mode、`ArtifactFeaturePolicy` 两阶段判定、dynamic flag mask、board limits/峰值 RAM、duplicate relocation 和 relative result policy、stage-neutral range error | source version、ABI flag/Thumb entry、dynamic flags、peak budget、duplicate/overlap target、映像外 value、精确 allocation len 和错误 stage 矩阵 |
-| P0-C15 `loader: apply prepared protection and cache plans` | canonical segment permission、granule/slot/alias preflight、batch protection、逐 range `AppliedProtection`、board cache capability/SMP scope、fuzz/corpus | granule 冲突在副作用前失败；partial apply 触发 owned abort/fixed poison；cache-enabled ARM 和 RISC-V SMP 不误报；所有 malformed/fault points 与真实 QEMU oracle 通过 |
+| P0-C15 `loader: apply prepared protection and cache plans` | canonical segment permission、granule/slot/alias preflight、batch protection、逐 range `ProtectionRecord`、board cache capability/SMP scope、fuzz/corpus | granule 冲突在副作用前失败；partial apply 触发 owned abort/fixed poison；cache token 必须保持全部 X range；cache-enabled ARM 和 RISC-V SMP 不误报；所有 malformed/fault points 与真实 QEMU oracle 通过 |
 
 P0-C13 只修正单映像事务，不引入 Phase 0.5 的 dependency graph、registry、generation table 或 loader lock。P0-C14/P0-C15 允许调整 P0-C01–P0-C09 已有类型，但不得重新增加第二套 parser、mapping 或 relocation 路径。
 
@@ -1633,10 +1678,10 @@ kernel/loader/src/
 | `TargetWord/WordWidth` | P0-C07 | 第一次按目标 ELF 字宽读写 relocation value |
 | `ArchRelocator/RelocatedImage` | P0-C07 | 执行并证明 relative relocation 已完成 |
 | `ArmRelocator` | P0-C08 | 增加 ARM32 REL 隐式 addend |
-| `CodeCache/SealPlan/SealedImage` | P0-C09 | 第一次允许把映像变为 sealed 但仍未提交的结果 |
-| `StagedImage<S>/PreparedImage/ReadyImageCommit/CommittedImage` | P0-C13 | 从 reserve 起把每个 state payload 与同一 rollback authority 绑定，并把 lease 转给成功 owner，保证 commit 后无失败点 |
+| `CodeCache/SealPlan/SealedState` | P0-C09 | 第一次允许把映像变为 sealed 但仍未提交的结果 |
+| `StagedImage<S>/PreparedImage/ReadyImageCommit/M::CommitReceipt` | P0-C13 | 从 reserve 起把每个 state payload 与同一 rollback authority 绑定，并把 lease 转给 backend 定义的成功 owner，保证 commit 后无失败点 |
 | `ArtifactFeaturePolicy` | P0-C14 | 在 S1/S4 统一执行 program/dynamic feature 判定 |
-| `PreparedProtectionPlan/AppliedProtection` | P0-C15 | 区分逻辑计划、backend 实际范围和真实保护级别 |
+| `PreparedProtectionPlan/ProtectionRecord/AppliedProtectionSet` | P0-C15 | 区分逻辑计划、预分配记录、backend 实际范围和真实保护级别 |
 
 以下类型不在 Phase 0 引入：
 
@@ -1660,13 +1705,13 @@ kernel/loader/src/
 - P0-C05 扩展 `FakeMemory`：记录 write/zero 并支持逐调用失败；
 - P0-C06 扩展 `FakeMemory`：记录有界 read 并支持逐调用失败；
 - P0-C07 扩展 `FakeMemory`：支持目标 word read/write；
-- P0-C09/P0-C15 `FakeCodeCache`：记录 allocation、全部 X range、hart scope/capability 并支持失败；
-- P0-C15 `FakeProtectionBackend`：配置 granule/region 数量/实际权限和逐调用失败；
+- P0-C09/P0-C15 `FakeCodeCache`：记录全部 X range、execution-context scope/capability，支持遗漏 range、capability 不足和同步失败；
+- P0-C15 `FakeProtectionBackend`：配置 granule/region 数量、enforcement level 和逐调用失败；
 - P0-C13 `FakeCommitTarget`：分别在 preflight、install 前后验证 rollback authority 和不可失败 commit。
 
 异常输入优先使用小型人工 fixture；真实工具链 fixture 用于验证 ABI 和 relocation oracle，两者不能相互替代。
 
-P0-C15 增加 parser/layout/dynamic/relocation 的 fuzz target 和最小 regression corpus。fuzz 只负责发现 panic、越界、非确定错误和资源上限绕过；每个发现都收敛为可独立运行的 deterministic unit test，不能用“跑过一段时间”替代下表语义 oracle。
+P0-C15 在 `kernel/loader/fuzz/loader_fuzz.rs` 增加 parser/layout/dynamic/relocation 共用的 fuzz target，并在 `kernel/loader/fuzz/corpus/` 保存空输入、截断 magic、ARM32 合法最小映像、RISC-V64 合法最小映像和带 `R_RISCV_RELATIVE` 的深路径种子。target 在 `cfg(fuzzing)` 下导出 libFuzzer ABI；普通 GN host 构建则对 corpus、边界截断和定点 bit flip 作确定回归，`check_loader`/`check_loader_host` 都会执行。fuzz 只负责发现 panic、越界、非确定错误和资源上限绕过；每个发现仍须收敛为可独立运行的 deterministic unit test，不能用“跑过一段时间”替代下表语义 oracle。
 
 ### 18.2 单元测试矩阵
 
@@ -1674,12 +1719,12 @@ P0-C15 增加 parser/layout/dynamic/relocation 的 fuzz target 和最小 regress
 | --- | --- |
 | reader/admission | 空文件、短读、snapshot 改变、错误 class/endian/machine/type/e_flags/entry mode、phdr 范围溢出、board/峰值字节上限 |
 | parser/policy | 无 section header、多 `PT_LOAD`、重复 dynamic/stack；parser 记录 interp/tls，Phase 0 policy 在 allocation 前拒绝 |
-| layout | 非零 min vaddr、gap、非法 align、不同余、filesz>memsz、overlap、非 canonical 权限、entry 非 X/未对齐/ARM even |
+| layout | 非零 min vaddr、gap、非法 align、不同余、filesz>memsz、overlap、非 canonical 权限、entry 非 X/未对齐/ARM even/最小指令跨度越界 |
 | allocation | OOM、错误 base/exact len/align、fixed 越权、owned abort exactly once、modified fixed poison/reset |
 | mapping | 大 BSS、预填充非零、分块 copy、gap locate、reader/target alias、read/write/zero failure |
 | metadata | REL/RELA descriptor、table 越界、错误 entry size、数量/字节上限、dynamic tag/flag bit matrix |
 | relocation | RISC-V64 RELA、ARM32 REL、隐式 addend、未知类型、symbol!=0、越界、未对齐、溢出、duplicate/overlap target、映像外 value |
-| seal | RX/R/RW+NX、RELRO、gap NONE、granule/slot/alias 冲突、requested/applied range、cache capability/scope、partial apply failure |
+| seal | RX/R/RW+NX、RELRO、gap NONE、granule/slot/alias 冲突、requested/applied range 与唯一目标 permission、cache capability/scope、partial apply failure |
 | transaction | publisher preflight failure、wrong payload、stage Drop、commit 后无 fallible step、成功 owner/lease 存活 |
 | errors | 每个阶段的 arithmetic/backend failure 保留当前 `LoadStage` 和 primary error；不可失败 abort 的异常只能进入 backend diagnostics，不能覆盖 primary error |
 
@@ -1717,22 +1762,23 @@ ESP32-C3 的 image action 依赖 `esptool` 4.x API，并会下载官方 bootload
 - [x] 非零最低 vaddr 使用正确 load bias；
 - [x] owned `ET_DYN` allocation 和 BSS 确定性清零；
 - [x] `locate()` 拒绝 allocation gap 和错误权限；
-- [ ] relative relocation 除 target owner/范围/字宽/端序/对齐/溢出外，还拒绝 duplicate/overlap target，并按 profile 校验结果地址；
+- [x] relative relocation 除 target owner/范围/字宽/端序/对齐/溢出外，还拒绝 duplicate/overlap target，并按 profile 校验结果地址；
 - [x] 未知或非白名单 relocation fail closed；
-- [ ] parser 与 policy 分离；`PT_INTERP/PT_TLS/DT_NEEDED/TEXTREL` 及 `DT_FLAGS/DT_FLAGS_1` bit mask 由同一 `ArtifactFeaturePolicy` 判定；
-- [ ] `ElfReader` 固化不可变 snapshot 契约，VFS/source 变化不能形成 TOCTOU；
-- [ ] ARM/RISC-V `e_flags`、Thumb entry bit、指令对齐和 board-specific limits 全部进入 admission gate；
-- [ ] cache backend 缺失时失败；cache-enabled ARM 和 RISC-V SMP 不把 barrier/local-hart 同步误报为完整同步；
-- [ ] 逐 range 记录 requested/applied protection；granule、MPU slot、alias 和 RELRO 冲突在 apply 前失败；
-- [ ] segment gap、alignment padding 和整个 logical allocation 均进入 `SealPlan`；backend 物理 padding 不对 loader 暴露；
-- [ ] owned S2–S8 失败 exactly-once abort；modified borrowed fixed 明确 poisoned，不能声称恢复旧内容；
-- [ ] reserve 后每个 `StagedImage<S>` 都携带同一 transaction，转换 API 不再接受独立 transaction 参数；错误 transaction/payload 不可配对或提交；
-- [ ] reader/write/zero/read/cache/protection/publisher 每个调用点均有故障注入，错误保留正确 `LoadStage`；
-- [ ] 只有成功接管 `AllocationLease` 的 committed owner 公开 entry，且 owner 保证 entry 使用期间映射存活；
-- [ ] 所有 fallible publish/install preflight 在 commit 前完成，commit 本身不分配、不返回 `Result`；
+- [x] parser 与 policy 分离；`PT_INTERP/PT_TLS/DT_NEEDED/TEXTREL` 及 `DT_FLAGS/DT_FLAGS_1` bit mask 由同一 `ArtifactFeaturePolicy` 判定；
+- [x] `ElfReader` 固化不可变 snapshot 契约，VFS/source 变化不能形成 TOCTOU；
+- [x] ARM/RISC-V `e_flags`、Thumb entry bit、指令对齐和 board-specific limits 全部进入 admission gate；
+- [x] cache backend 缺失时失败；cache-enabled ARM 和 RISC-V SMP 不把 barrier/local-hart 同步误报为完整同步；
+- [x] 逐 range 记录 requested/applied protection；granule、MPU slot、alias 和 RELRO 冲突在 apply 前失败；
+- [x] segment gap、alignment padding 和整个 logical allocation 均进入 `SealPlan`；backend 物理 padding 不对 loader 暴露；
+- [x] owned S2–S8 失败 exactly-once abort；modified borrowed fixed 明确 poisoned，不能声称恢复旧内容；
+- [x] reserve 后每个 `StagedImage<S>` 都携带同一 transaction，转换 API 不再接受独立 transaction 参数；错误 transaction/payload 不可配对或提交；
+- [x] reader/write/zero/read/cache/protection/publisher 每个调用点均有故障注入，错误保留正确 `LoadStage`；
+- [x] 只有成功接管 `AllocationLease` 的 committed owner 公开 entry，且 owner 保证 entry 使用期间映射存活；
+- [x] 所有 fallible publish/install preflight 在 commit 前完成，commit 本身不分配、不返回 `Result`；
 - [x] 旧 `load_elf()` 只剩兼容包装；
 - [x] 仓库中没有第二套生产 parser、copy 或 relocation 实现；
 - [x] ARM32 host fixture、RISC-V64 `ET_DYN`、RISC-V32 fixed `ET_EXEC` 和 QEMU 回归通过。
-- [ ] malformed corpus/fuzz target 纳入 CI，并对 AArch64 兼容路径作出“补齐或正式移除”的明确决定。
+- [x] AArch64 compatibility relocation/execution 正式移出 Phase 0，并由 `load_elf()` 明确拒绝；
+- [x] malformed corpus/fuzz target 纳入 `check_loader` 与 `check_loader_host`。
 
 达到以上条件后，Phase 0.5 才可以直接以 `RuntimeImage/RelocatedImage/PreparedImage` 为基础增加 dependency graph、symbol scope 和多映像 `LinkSession`，并把单 allocation guard 扩展为多资源 rollback log，而无需再次推翻单映像的地址、布局、复制、relative relocation、seal 和 ownership 语义。

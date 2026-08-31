@@ -141,7 +141,7 @@ kernel/kernel/src/application/
     initial_stack.rs
 ```
 
-指令缓存维护（`fence.i`、D-clean/I-invalidate）实现在 `arch/*/cache.rs` 作为架构通用服务，`ApplicationLoader` 直接调用 `sync_instruction_cache`，不再设 `code_cache.rs` adapter 文件。
+指令缓存维护（`fence.i`、D-clean/I-invalidate）实现在 `arch/*/cache.rs` 作为架构通用服务；`ArchCodeCache` 适配 `CodeCache::prepare/synchronize` 契约，loader 核心负责核对 prepared token 的全部 X range 与 scope/maintenance capability，并在同步后核对 outcome 与已验证 token 完全一致。`ApplicationLoader` 不再绕过 loader 直接维护另一条 cache 路径。
 
 ## 2. 需要修改的现有代码
 
@@ -241,10 +241,12 @@ pub enum LoadStage {
     Validate,
     Plan,
     Allocate,
-    Copy,
+    Map,
+    Metadata,
     Dependency,
     Symbol,
     Relocate,
+    Cache,
     Seal,
     Publish,
     Initialize,
@@ -278,71 +280,77 @@ pub enum LoadStage {
 
 ```rust
 pub trait ElfReader {
-    fn len(&self) -> Result<u64, LoadError>;
+    fn snapshot(&self) -> LoadResult<SourceSnapshot>;
+    fn len(&self) -> LoadResult<u64>;
     fn read_exact_at(
         &self,
         offset: u64,
         dst: &mut [u8],
-    ) -> Result<(), LoadError>;
+    ) -> LoadResult<()>;
 }
 
 pub trait ImageMemory {
     fn allocate_image(
         &mut self,
         request: &AllocationRequest,
-    ) -> Result<ImageAllocation, LoadError>;
+    ) -> LoadResult<AllocationLease>;
 
-    fn target_base(
+    fn abort_image(
+        &mut self,
+        lease: AllocationLease,
+        progress: MutationProgress,
+    );
+
+    fn release_committed(&mut self, lease: AllocationLease);
+
+    fn validate_access(
         &self,
-        allocation: AllocationId,
-    ) -> Result<TargetAddr, LoadError>;
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> MemoryResult<()>;
 
     fn write(
         &mut self,
-        allocation: AllocationId,
-        offset: u64,
+        location: TargetLocation,
         data: &[u8],
-    ) -> Result<(), LoadError>;
+    ) -> MemoryResult<()>;
 
     fn zero(
         &mut self,
-        allocation: AllocationId,
-        offset: u64,
+        location: TargetLocation,
         len: u64,
-    ) -> Result<(), LoadError>;
+    ) -> MemoryResult<()>;
 
-    fn read_word(
+    fn read(
         &self,
         location: TargetLocation,
-        width: WordWidth,
-    ) -> Result<TargetWord, LoadError>;
-
-    fn write_word(
-        &mut self,
-        location: TargetLocation,
-        width: WordWidth,
-        value: TargetWord,
-    ) -> Result<(), LoadError>;
+        dst: &mut [u8],
+    ) -> MemoryResult<()>;
 
     fn protect(
         &mut self,
-        allocation: AllocationId,
-        range: TargetRange,
-        perms: MemoryPermissions,
-    ) -> Result<ProtectionResult, LoadError>;
-
-    fn release(&mut self, allocation: AllocationId);
+        location: TargetLocation,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> MemoryResult<ProtectionLevel>;
 }
 
 pub trait CodeCache {
-    fn sync_instruction_cache(
-        &mut self,
-        allocation: AllocationId,
+    fn requirements(&self) -> CacheRequirements;
+
+    fn prepare(
+        &self,
         executable_ranges: &[TargetRange],
-    ) -> Result<(), LoadError>;
+    ) -> Result<PreparedCacheSync, LoadError>;
+
+    fn synchronize(
+        &mut self,
+        prepared: PreparedCacheSync,
+    ) -> Result<CacheSyncOutcome, LoadError>;
 }
 
-pub enum ProtectionResult {
+pub enum ProtectionLevel {
     LogicalOnly,
     HardwareEnforced,
 }
@@ -351,10 +359,12 @@ pub enum ProtectionResult {
 关键约束：
 
 - `DynamicLinker` 不能直接解引用 `TargetAddr`。
-- relocation 必须先通过 `LoadedImage<S>::locate()` 转换为 `TargetLocation`。
+- relocation 必须先通过对应 `StagedImage<'_, M, S>` 的已验证映射状态转换为 `TargetLocation`。
 - `FlatImageMemory` 才能把 allocation+offset 转换为当前内核指针。
+- address arithmetic 与 byte decoder 返回 stage-neutral `RangeError`，memory access backend 返回 stage-neutral `MemoryError`；消费点必须绑定实际 `LoadStage`。
 - `protect()` 在无 MPU/MMU 平台可以返回 `LogicalOnly`，但不能假装已经物理保护。
-- `CodeCache` 未实现时加载失败，不能提供空 stub。
+- `CodeCache` 未实现时加载失败，不能提供空 stub；prepared token 遗漏或替换任一 X range、scope 不足或 maintenance 类型不符时，都必须在同步和保护副作用前失败；同步后的 outcome 若与该 token 不一致则按 backend 契约违例回滚。
+- protection 结果槽由 loader core 预分配并持有；backend 只接受不暴露可变 slice 的固定长度 `ProtectionBatch`，读取请求并按 index 填写实际 enforcement，不能改写/交换记录或返回一份可遗漏、增报的结果集合。
 
 架构接口：
 
@@ -456,17 +466,17 @@ pub struct SegmentLayout {
 - `p_offset % p_align == p_vaddr % p_align`
 - segment/file/image 配额
 - W+X、重叠权限冲突
-- entry 必须落在 X segment
+- canonical entry 开始的最小指令跨度必须完整落在 X segment
 - 非零最低 `p_vaddr`
 - segment gap
 - 最大对齐和正确 load bias
 
-### 5.3 分阶段 `LoadedImage`
+### 5.3 分阶段 `StagedImage`
 
-`LoadedImage` 不保存可任意改写的 `ImageState`。映像共有字段放入 `LoadedImageData`，阶段专有数据放入 `S`；只有合法阶段的 `impl` 才暴露下一步方法：
+`StagedImage<'a, M, S>` 把唯一 rollback authority 与阶段 payload 绑定，字段保持私有，转换方法消费旧对象。映像共有的 mapped 数据嵌在后续 state 中沿管线移动，不再另设一个可与 transaction 分离的公共数据壳；只有合法阶段的 `impl` 才暴露下一步方法：
 
 ```rust
-pub struct LoadedImageData {
+pub struct MappedState {
     id: ImageId,
     identity: ImageIdentity,
     kind: ImageKind,
@@ -475,35 +485,48 @@ pub struct LoadedImageData {
     entry: TargetAddr,
     regions: Vec<LoadedRegion>,
     debug: ImageDebugInfo,
-}
-
-pub struct LoadedImage<S> {
-    data: LoadedImageData,
-    stage: S,
-}
-
-pub struct MappedState {
     parsed: ParsedImage,
 }
 
-pub struct RuntimeMetadataState {
+pub struct RuntimeState {
+    mapped: MappedState,
     metadata: RuntimeImageMetadata,
 }
 
 pub struct RelocatedState {
+    mapped: MappedState,
     metadata: RuntimeImageMetadata,
 }
 
 pub struct SealedState {
+    mapped: MappedState,
     metadata: RuntimeImageMetadata,
-    protections: Vec<AppliedProtection>,
+    protections: Vec<ProtectionRecord>,
 }
 
-pub type MappedImage = LoadedImage<MappedState>;
-pub type RuntimeImage = LoadedImage<RuntimeMetadataState>;
-pub type RelocatedImage = LoadedImage<RelocatedState>;
-pub type SealedImage = LoadedImage<SealedState>;
+pub struct StagedImage<'a, M: ImageMemory, S> {
+    transaction: ImageLoadTransaction<'a, M>,
+    state: S,
+}
+
+pub type MappedImage<'a, M> = StagedImage<'a, M, MappedState>;
+pub type RuntimeImage<'a, M> = StagedImage<'a, M, RuntimeState>;
+pub type RelocatedImage<'a, M> = StagedImage<'a, M, RelocatedState>;
+pub type PreparedImage<'a, M> = StagedImage<'a, M, SealedState>;
 ```
+
+Phase 0.5 不能把多个仍各自借用 `&mut M` 的 `StagedImage` 直接塞进 `Vec`。`LinkSession` 应顺序消费单映像 stage，经 crate-private absorption 把其 state 与 `AllocationLease` 移入 session rollback log，随即结束该次 `M` 借用，再处理下一映像；对外不提供“脱离 guard 取出 state”的 API。这样复用 Phase 0 的单映像管线，同时把一条单 allocation guard 扩展成 session 的多资源事务，而不是建立第二套 typestate wrapper。
+
+Phase 0.5 在 S9 边界增加一个内部所有权记录；它不是新的解析/重定位 typestate，而是防止 sealed 数据与 allocation lease 分离的资源包：
+
+```rust
+pub(crate) struct OwnedImage {
+    sealed: SealedState,
+    lease: AllocationLease,
+}
+```
+
+`OwnedImage` 的字段保持 private，且只能由 `SealedSession::commit` 在所有可失败准备完成后，从同一 session 的 sealed state 和 rollback log 中配对形成。发布前它由 `PublicationGuard` 持有并可按失败语义 abort；发布成功后整体移入 `LinkContext`、system DSO instance 或最终的 `ReapResources`，按成功语义 release。任何阶段都不能只移动 `SealedState` 或复制 allocation 描述来替代 lease。
 
 所有阶段共有的只读方法：
 
@@ -515,9 +538,11 @@ pub type SealedImage = LoadedImage<SealedState>;
 
 - `MappedImage::decode_runtime(policy) -> RuntimeImage`
 - `RuntimeImage::symbol_address(symbol)`
-- `RuntimeImage::into_relocated() -> RelocatedImage`，仅由完成整组 relocation 的 `LinkSession<LinkScopedState>` 调用
-- `RelocatedImage::seal(memory, cache, plan) -> SealedImage`
-- `SealedImage::build_link_map_entry()`
+- Phase 0 的 `RuntimeImage::relocate(relative_relocator) -> RelocatedImage`
+- `RelocatedImage::seal(cache) -> PreparedImage`
+- `PreparedImage::prepare_commit() -> ReadyImageCommit`
+
+Phase 0.5 的完整 relocation 不通过公开的 `into_relocated()` 跳过工作；`ScopedSession::relocate()` 在 session 内部消费每个 `RuntimeState`，完成 relative、symbol 和 PLT 全部 pass 后才能形成 `RelocatedState`。同理，只有 `SealedSession` 内的 `SealedState` 能构造 `LinkMapEntry`，单映像 `PreparedImage` 不提供提前发布入口。
 
 `RuntimeImageMetadata` 是 S4 的输出，保存已经过 load-bias 和 region 范围校验的 dynamic、symbol、relocation 与 lifecycle 视图；它不同于 S1 中仍以 ELF vaddr/file range 表示的 `DynamicInfo`。这样 relocation 和构造计划不会再次解释原始 dynamic tag。
 
@@ -610,28 +635,29 @@ pub struct ResolvedSymbol {
 
 ```rust
 pub struct LinkBuildingState {
-    pending_images: Vec<RuntimeImage>,
+    pending_images: Vec<RuntimeState>,
     discovery: DiscoveryQueue,
 }
 pub struct LinkScopedState {
-    images: Vec<RuntimeImage>,
+    images: Vec<RuntimeState>,
     scopes: ScopeSet,
 }
 pub struct LinkRelocatedState {
-    images: Vec<RelocatedImage>,
+    images: Vec<RelocatedState>,
     scopes: ScopeSet,
 }
 pub struct LinkSealedState {
-    images: Vec<SealedImage>,
+    images: Vec<SealedState>,
     scopes: ScopeSet,
 }
 
-pub struct LinkSession<S> {
-    data: LinkSessionData,
+pub struct LinkSession<'a, M: ImageMemory, S> {
+    data: LinkSessionData<'a, M>,
     stage: S,
 }
 
-struct LinkSessionData {
+struct LinkSessionData<'a, M: ImageMemory> {
+    memory: &'a mut M,
     graph: DependencyGraph,
     rollback_log: Vec<RollbackAction>,
     metrics: LoadMetrics,
@@ -644,10 +670,10 @@ enum SessionDisposition {
     RolledBack,
 }
 
-pub type BuildingSession = LinkSession<LinkBuildingState>;
-pub type ScopedSession = LinkSession<LinkScopedState>;
-pub type RelocatedSession = LinkSession<LinkRelocatedState>;
-pub type SealedSession = LinkSession<LinkSealedState>;
+pub type BuildingSession<'a, M> = LinkSession<'a, M, LinkBuildingState>;
+pub type ScopedSession<'a, M> = LinkSession<'a, M, LinkScopedState>;
+pub type RelocatedSession<'a, M> = LinkSession<'a, M, LinkRelocatedState>;
+pub type SealedSession<'a, M> = LinkSession<'a, M, LinkSealedState>;
 ```
 
 方法只出现在对应阶段：
@@ -656,13 +682,13 @@ pub type SealedSession = LinkSession<LinkSealedState>;
 BuildingSession::load_root(&mut self)
 BuildingSession::expand_dependencies_bfs(&mut self)
 BuildingSession::freeze_scopes(self)          -> ScopedSession
-ScopedSession::relocate(self, arch, memory)   -> RelocatedSession
-RelocatedSession::seal(self, memory, cache)   -> SealedSession
-SealedSession::build_lifecycle_plans(&self, memory) -> (InitPlan, FiniPlan)
-SealedSession::commit(self)                   -> LinkProduct
+ScopedSession::relocate(self, arch)           -> RelocatedSession
+RelocatedSession::seal(self, cache)           -> SealedSession
+SealedSession::build_lifecycle_plans(&self)   -> (InitPlan, FiniPlan)
+SealedSession::commit(self)                   -> LinkProduct<'a, M>
 ```
 
-stage payload 独占对应阶段的 typed image，`LinkSessionData` 独占这些资源的 rollback authority；任何阶段的会话在 `Drop` 时如果 `disposition == Active`，自动按逆序：
+stage payload 只保存对应阶段的 state，`LinkSessionData` 独占 memory backend 和这些资源的 rollback authority。装载单个依赖时，session 对 `memory` 建立一次短暂 reborrow；crate-private absorption 必须先取回 state 与 lease、结束 `StagedImage` 借用，再分别移入 stage payload 和 rollback log。任何阶段的会话在 `Drop` 时如果 `disposition == Active`，自动通过同一个 backend 按逆序：
 
 - 取消 registry load permit
 - 释放临时 lease
@@ -681,7 +707,7 @@ pub struct DynamicLinker<P, A> {
     arch: A,
 }
 
-pub struct LinkProduct {
+pub struct LinkProduct<'a, M: ImageMemory> {
     context: LinkContext,
     entry: TargetAddr,
     main_program_headers: ProgramHeaderRuntimeInfo,
@@ -689,7 +715,12 @@ pub struct LinkProduct {
     fini_plan: FiniPlan,
     link_map: Vec<LinkMapEntry>,
     metrics: LoadMetrics,
-    publication_guard: PublicationGuard,
+    publication_guard: PublicationGuard<'a, M>,
+}
+
+pub struct PublicationGuard<'a, M: ImageMemory> {
+    memory: &'a mut M,
+    batch: Option<PublicationBatch>,
 }
 ```
 
@@ -709,7 +740,7 @@ pub struct LinkProduct {
 - link map
 - 不直接拥有 system DSO allocation
 
-`LinkProduct` 仍是未发布对象。`PublicationGuard` 接管原 session 的 allocation/permit/lease 回滚能力；`ApplicationLoader::publish_link_product()` 成功把资源移动到 ThreadGroup/System DSO registry 后才解除 guard。因而 `SealedSession::commit()` 只表示“冻结成可提交产品”，不表示其他线程已经可见；若后续内核 publish 失败，`LinkProduct` 仍能完整回滚。
+`LinkProduct` 仍是未发布对象。`PublicationGuard<'a, M>` 接续原 session 对同一 backend 的唯一可变借用，并接管 allocation/permit/lease 回滚能力；`ApplicationLoader::publish_link_product()` 成功把 `OwnedImage` 移动到 ThreadGroup/System DSO registry 后才解除 guard。长期 owner 保存 lease，最终由 reaper/quiescence 路径把 lease 交回对应 memory service 执行 `release_committed()`。因而 `SealedSession::commit()` 只表示“冻结成可提交产品”，不表示其他线程已经可见；若后续内核 publish 失败或 product 未被消费，guard 仍能通过原 backend 完整回滚。
 
 ### 6.4 Phase 3 的运行期链接状态
 
@@ -728,10 +759,10 @@ pub struct RuntimeLinkState {
     pub handles: RuntimeDsoHandleTable,
 }
 
-pub struct RuntimeLoadSession {
+pub struct RuntimeLoadSession<'a, M: ImageMemory> {
     pub baseline_generation: u64,
     pub root: ArtifactIdentity,
-    pub new_group: LinkSession<LinkBuildingState>,
+    pub new_group: BuildingSession<'a, M>,
     pub flags: DlopenFlags,
 }
 
@@ -954,7 +985,7 @@ pub struct SystemDsoLoadPermit {
 
 pub struct SystemDsoInstance {
     pub artifact: Arc<DsoArtifact>,
-    pub image: SealedImage,
+    pub image: OwnedImage,
     pub link_context: LinkContext,
     pub init_state: InitState,
     pub fini_plan: FiniPlan,
@@ -1041,7 +1072,7 @@ Phase 3 再追加运行期 DSO ABI：`DynamicLibraryPrepareOpen/NextInitializer/
 2. system resolver 只接受固定可信路径和 catalog identity；依赖图按 SONAME 与文件身份双重去重；application/system scope 在 relocation 前冻结，应用不能 interpose system DSO 自身解析，也不获得完整内核符号表。
 3. 每条 relocation 的 `P` 必须能转换为当前 owner 中带 allocation、offset、width 和权限的 `TargetLocation`；写入前校验范围、对齐、目标字宽、addend 和所有算术，未知类型和缺失 strong symbol fail-closed。
 4. `S` 必须来自当前冻结 scope。`JUMP_SLOT` 等明确的控制流 relocation、ELF entry 及 init/fini entry 必须落在允许 owner 的 X region；undefined weak=0 是否允许由 artifact profile 显式决定，不能作为通用 X-range 旁路；符号类型、Thumb bit 等架构规则由 `ArchRelocator` 处理。该规则不覆盖已静态解析的直接分支、运行期函数指针、返回地址或应用自行计算的间接跳转，不能标记为 CFI。
-5. S9 前映像不能被线程入口、registry Ready 实例或公共 link map 发现；全部 relocation 完成后才执行 `SealPlan`，形成 text RX、rodata/RELRO R、data/BSS RW+NX，完成 cache 同步后再原子发布。`AppliedProtection` 必须准确记录 `LogicalOnly` 或 `HardwareEnforced`。
+5. S9 前映像不能被线程入口、registry Ready 实例或公共 link map 发现；全部 relocation 完成后才执行 `SealPlan`，形成 text RX、rodata/RELRO R、data/BSS RW+NX，完成 cache 同步后再原子发布。`ProtectionRecord` 必须准确记录 `LogicalOnly` 或 `HardwareEnforced`。
 6. S0–S8 任一步失败由 rollback log 逆序释放；S9 后由 ThreadGroup、lease 和 deferred reaper 保活，执行流、callback、TLS destructor 或外部引用未静默前不得释放代码。
 
 这些规则的验收以畸形 ELF corpus、人工 relocation fixture、故障注入和状态快照完成，不依赖 MPU/PMP。它们保证“loader 不替应用越界写或制造非法 relocation-backed 跳转”，不保证同特权应用开始执行后不能直接访问系统地址。
@@ -1056,7 +1087,7 @@ Phase 3 再追加运行期 DSO ABI：`DynamicLibraryPrepareOpen/NextInitializer/
 | RISC-V32/64 | 当前只支持 M-mode，源码明确 S/U mode 尚未支持；没有应用 PMP domain | 后续架构 backend 仍只运行内置/构建期 allowlist 的可信特权代码；loader 继续做范围和权限逻辑校验 | U mode、trap/syscall、PMP layout、每线程 protection-domain id、上下文切换和 fault 恢复 |
 | AArch64 | EL1 MMU linear map 已存在，但 EL0 vector 明确 unsupported | 可以增加内核映像页的 W^X/RELRO hardening 实验 | EL0 entry/return、独立 address space/ASID、用户页映射、copy-in/out、异常归属 |
 
-未来演进时，`ProtectionDomain::level()` 必须返回实际能力：`LogicalOnly`、`HardwarePermissions` 或 `IsolatedDomain`。只有第三种且配套非特权执行、保护域切换、fault attribution、资源配额和 syscall copy-in/out 全部完成时，产品才可以宣称动态应用被隔离。单个 region 的 `ImageMemory::protect()` 只返回 `ProtectionResult::LogicalOnly` 或 `ProtectionResult::HardwareEnforced`；签名验证证明发布者身份，不等于运行时 containment。
+未来演进时，`ProtectionDomain::level()` 必须返回实际能力：`LogicalOnly`、`HardwarePermissions` 或 `IsolatedDomain`。只有第三种且配套非特权执行、保护域切换、fault attribution、资源配额和 syscall copy-in/out 全部完成时，产品才可以宣称动态应用被隔离。单个 region 的 `ImageMemory::protect()` 只返回 `ProtectionLevel::LogicalOnly` 或 `ProtectionLevel::HardwareEnforced`；签名验证证明发布者身份，不等于运行时 containment。
 
 ### 8.4 后续演进的 `ProtectionDomain` 预留接口
 
@@ -1336,11 +1367,11 @@ ArtifactRequest
 类型设计遵循四条规则：
 
 1. 阶段转换方法消费上一个阶段对象并返回下一个阶段对象，不提供公开的 `set_state()`。
-2. 只在会改变合法 API 集合的边界使用 typestate：映像使用 `MappedImage/RuntimeImage/RelocatedImage/SealedImage`，链接事务使用 `BuildingSession/ScopedSession/RelocatedSession/SealedSession`。解析、BFS 队列等局部步骤使用普通内部状态，避免泛型爆炸。
+2. 只在会改变合法 API 集合的边界使用 typestate：单映像事务使用 `MappedImage/RuntimeImage/RelocatedImage/PreparedImage`，链接事务使用 `BuildingSession/ScopedSession/RelocatedSession/SealedSession`。session 内只保存 `RuntimeState/RelocatedState/SealedState` payload，解析、BFS 队列等局部步骤使用普通内部状态，避免泛型爆炸和对同一 backend 的重叠可变借用。
 3. `S0`–`S8` 的 allocation、临时 system DSO permit/lease 和未发布元数据统一归 `LinkSessionData` 的 rollback log 所有；阶段转换失败即随旧对象 `Drop`。
 4. `S9` 是资源所有权和可见性提交点，`S10` 是不可自动回滚副作用边界。`LinkSession` 不执行 ctor，`ApplicationManager` 不持全局锁执行 ctor/fini 或应用入口。
 
-所有阶段输出类型的字段和直接构造函数默认是 private 或 `pub(crate)`；调用方只能通过只读 accessor 和本节列出的转换方法使用它们。下面只有 `ArtifactRequest` 等纯输入值允许公开字段，不能通过 struct literal 伪造 `AdmittedArtifact`、`MappedImage`、`ScopedSession`、`SealedImage` 或 `LinkProduct`。
+所有阶段输出类型的字段和直接构造函数默认是 private 或 `pub(crate)`；调用方只能通过只读 accessor 和本节列出的转换方法使用它们。下面只有 `ArtifactRequest` 等纯输入值允许公开字段，不能通过 struct literal 伪造 `AdmittedArtifact`、`MappedImage`、`ScopedSession`、`PreparedImage`、`OwnedImage` 或 `LinkProduct`。
 
 阶段与工程交付的对应关系如下：
 
@@ -1354,7 +1385,7 @@ ArtifactRequest
 | S5 依赖发现 | `DependencyGraph`、闭合的 `BuildingSession` | `DynamicLinker` | Phase 0.5 |
 | S6 scope | `ScopeSet`、`ScopedSession` | `DynamicLinker` | Phase 0.5 |
 | S7 relocation | `RelocatedImage`、`RelocatedSession` | `DynamicLinker`/`ArchRelocator` | Phase 0 relative 子集；Phase 0.5 完整 MVP |
-| S8 seal | `SealPlan`、`SealedImage`、`SealedSession` | `ImageMemory`/`CodeCache` | Phase 0 接口；Phase 1 平台落地 |
+| S8 seal | `SealPlan`、`PreparedImage`、`SealedSession` | `ImageMemory`/`CodeCache` | Phase 0 接口；Phase 1 平台落地 |
 | S9 publish | `LinkProduct`、`LinkContext`、`LinkMapEntry` | `ApplicationLoader`/registry | Phase 0.5 host；Phase 1 内核落地 |
 | S10 initialize | `InitPlan`、`FiniPlan`、`ApplicationStartStorage` | `ApplicationManager`/`librs` | Phase 1 |
 | S11 enter/exit/reap | `ThreadGroup`、`ThreadGroupMembership`、`ReapResources` | `ApplicationManager`/reaper | Phase 1 |
@@ -1416,7 +1447,7 @@ pub struct PlannedArtifact<R> {
 - `ImageLayout::load_bias_for(mapped_base)`：校验最大 `p_align` 后计算显式 load bias。
 - `ImageLayout::locate_vaddr_range(vaddr, len, perms)`：供后续阶段复用同一套 range 判定。
 
-这一阶段拒绝 `p_filesz > p_memsz`、非法对齐、file/vaddr 溢出、冲突重叠、W+X、非 X entry 和资源超限。输出仍未持有 allocation，可安全、廉价地丢弃。
+这一阶段拒绝 `p_filesz > p_memsz`、非法对齐、file/vaddr 溢出、冲突重叠、W+X、canonical entry 的最小指令跨度未完整落入 X segment，以及资源超限。输出仍未持有 allocation，可安全、廉价地丢弃。
 
 ### 11.4 S2：reserve/allocate
 
@@ -1434,7 +1465,7 @@ pub struct ReservedImage<R> {
 
 `ImageAllocation` 至少保存 `AllocationId`、实际 target base、长度、对齐和 backend capability；不暴露 host pointer。需要实现：
 
-- `ImageMemory::allocate_image(&AllocationRequest) -> ImageAllocation`。
+- `ImageMemory::allocate_image(&AllocationRequest) -> AllocationLease`；`ImageAllocation` 只是 lease 内的可复制描述符，不授予 abort/commit 权限。
 - `ImageLoader::reserve(planned, memory) -> ReservedImage<R>`。
 - `ImageAllocation::validate_layout(&ImageLayout)`：实际 base、长度和对齐必须满足已规划布局。
 - `RollbackLog::push_release_allocation(id)`：分配成功后立即登记，后续任何错误都能逆序释放。
@@ -1453,7 +1484,7 @@ pub struct LoadedRegion {
     logical_permissions: MemoryPermissions,
 }
 
-pub type MappedImage = LoadedImage<MappedState>;
+pub type MappedImage<'a, M> = StagedImage<'a, M, MappedState>;
 ```
 
 需要实现：
@@ -1486,7 +1517,7 @@ pub struct ImageLifecycleMetadata {
     fini_array: Option<FunctionArray>,
 }
 
-pub type RuntimeImage = LoadedImage<RuntimeMetadataState>;
+pub type RuntimeImage<'a, M> = StagedImage<'a, M, RuntimeState>;
 ```
 
 需要实现：
@@ -1599,14 +1630,14 @@ pub struct RelocationPolicy {
 
 需要实现：
 
-- `ScopedSession::relocate(self, arch, memory) -> RelocatedSession`。
+- `ScopedSession::relocate(self, arch) -> RelocatedSession`；memory 只能来自 session 内部，不能在转换时替换 backend。
 - `RelocationEngine::relocate_relative/relocate_symbols/relocate_plt`，顺序固定且统计分开。
 - `ArchRelocator::decode_relocation/read_rel_addend/apply`。
 - `RuntimeImage::locate`：把 relocation vaddr 转成带 allocation、offset、width 的 `TargetLocation`。
 - `SymbolScope::resolve_for_relocation` 和 `RuntimeImage::symbol_address`。
 - `RelocationPolicy::validate_request`：校验 relocation 类型白名单、`P` 的 image owner/允许写入权限、`S` 的冻结 scope owner，以及控制流 relocation 的最终 X region；架构函数地址编码由 `ArchRelocator` 归一化后验证。
-- `ImageMemory::read_word/write_word`：目标字宽、endianness、对齐和范围检查。
-- `RuntimeImage::into_relocated()` 仅为 session 内部转换；外部不能跳过 relocation。
+- `TargetWord::read/write` 基于 `ImageMemory::read/write` 完成目标字宽、endianness、对齐和范围检查，不在 backend 再建第二套 word API。
+- session 内部只有在三组 relocation pass 全部成功后，才通过 crate-private state 转换形成 `RelocatedState`；不存在可由外部调用、只改类型而跳过 relocation 的 `RuntimeImage::into_relocated()`。
 
 任何未知类型、溢出、缺失 strong symbol、越界/未对齐写、越权 symbol owner 或非 X 的控制流目标都使整笔 session 回滚；undefined weak=0 只有在 artifact profile 对相应 relocation 明确放行时例外。`R_*_RELATIVE` 的结果按当前 artifact profile 校验为允许的同映像目标；需要支持空值、one-past 或架构特殊编码时必须显式列入 profile，不能用“任意地址”兜底。Phase 0 以 ARM32 单映像 `R_ARM_RELATIVE` 打通 `DT_REL` 隐式 addend 读取；Phase 0.5/1 增加 `R_ARM_ABS32/R_ARM_GLOB_DAT/R_ARM_JUMP_SLOT`。首发 profile 之外的 relocation 全部拒绝。
 
@@ -1623,21 +1654,23 @@ pub struct SealPlan {
     executable_ranges: Vec<TargetRange>,
 }
 
-pub struct AppliedProtection {
-    pub range: TargetRange,
-    pub requested: MemoryPermissions,
-    pub result: ProtectionResult,
+pub struct ProtectionRecord {
+    pub location: TargetLocation,
+    pub requested_range: TargetRange,
+    pub applied_range: TargetRange,
+    pub permissions: MemoryPermissions,
+    pub level: ProtectionLevel,
 }
 ```
 
 需要实现：
 
-- `RelocatedSession::seal(self, memory, cache) -> SealedSession`。
+- `RelocatedSession::seal(self, cache) -> SealedSession`；保护写入只能使用 session 已持有的 memory backend。
 - `RelocatedImage::build_seal_plan()`：合并相邻同权限区间，RELRO 覆盖最终写权限；同时拒绝 W+X、TEXTREL、可执行栈和可执行区域的 writable alias，text 目标为 RX、rodata/RELRO 为 R、data/BSS 为 RW+NX。
 - `ImageMemory::protect`：返回 `HardwareEnforced` 或 `LogicalOnly`，不得谎报硬件保护。
-- `CodeCache::sync_instruction_cache`：覆盖所有新写入的 X range；ARM32 首发 `qemu_mps2_an385` 明确声明无硬件 cache，但仍执行 DSB/ISB 使代码写入与后续取指有序，不能用通用空 stub。cache-enabled Cortex-M 必须额外 clean D-cache、invalidate I-cache。
-- `RelocatedImage::seal(...) -> SealedImage`。
-- `SealedImage::build_link_map_entry()`：只有 sealed image 才能形成可发布条目。
+- `CodeCache::prepare/synchronize`：prepared token 精确覆盖所有新写入的 X range，并报告实际 scope/maintenance；完成 outcome 必须与该 token 完全一致；ARM32 首发 `qemu_mps2_an385` 明确声明无硬件 cache，但仍执行 DSB/ISB 使代码写入与后续取指有序，不能用通用空 stub。cache-enabled Cortex-M 必须额外 clean D-cache、invalidate I-cache。
+- Phase 0 的 `RelocatedImage::seal(cache) -> PreparedImage`；Phase 0.5 的 `RelocatedSession::seal(...) -> SealedSession` 在内部对 `RelocatedState` 执行同一套 seal 规则。
+- `SealedSession::build_link_map_entries()`：只有 session 内全部成功形成的 `SealedState` 才能形成待发布条目；单映像 `PreparedImage` 不能绕过 session 提前发布。
 
 没有可靠 cache backend 时本阶段失败；在 SMP 尚未实现远端 hart 同步前，运行时策略必须阻止其他 hart 执行新代码。
 
@@ -1646,7 +1679,7 @@ pub struct AppliedProtection {
 S9 把私有 session 的资源所有权移动到已发布对象，并一次性更新 ThreadGroup/System DSO registry/link map：
 
 ```rust
-pub struct LinkProduct {
+pub struct LinkProduct<'a, M: ImageMemory> {
     context: LinkContext,
     entry: TargetAddr,
     main_program_headers: ProgramHeaderRuntimeInfo,
@@ -1654,11 +1687,11 @@ pub struct LinkProduct {
     fini_plan: FiniPlan,
     link_map: Vec<LinkMapEntry>,
     metrics: LoadMetrics,
-    publication_guard: PublicationGuard,
+    publication_guard: PublicationGuard<'a, M>,
 }
 
 pub struct PublicationBatch {
-    images: Vec<SealedImage>,
+    images: Vec<OwnedImage>,
     system_leases: Vec<SystemDsoLease>,
     link_map: Vec<LinkMapEntry>,
 }
@@ -1666,8 +1699,8 @@ pub struct PublicationBatch {
 
 需要实现：
 
-- `SealedSession::build_lifecycle_plans(memory)`：从已经重定位的 init/fini array 读取函数地址，逐项验证 owner 和 X region，再基于 SCC DAG 生成依赖优先 init 与精确逆序 fini。
-- `SealedSession::commit(self) -> LinkProduct`：把 allocation/permit/lease 的回滚能力从 session 移入 `PublicationGuard`，session 自身不再回滚。
+- `SealedSession::build_lifecycle_plans()`：通过 session 自己的 memory backend 从已经重定位的 init/fini array 读取函数地址，逐项验证 owner 和 X region，再基于 SCC DAG 生成依赖优先 init 与精确逆序 fini。
+- `SealedSession::commit(self) -> LinkProduct<'a, M>`：在 commit 前预留全部 owner/link-map 容量并验证 sealed state 与 rollback lease 一一对应，再把 memory borrow 和 allocation/permit/lease 的回滚能力从 session 移入 `PublicationGuard`；session 自身不再回滚。形成 product 后不得再有分配或可失败的资源配对步骤。
 - `PublicationGuard::rollback()` 和 `disarm()`：前者按逆序撤销未发布资源，后者只能在 ThreadGroup/System DSO registry/link-map 全部接管成功后调用。
 - `ApplicationLoader::publish_link_product(group, product)`：原子安装 context/link map/lease；成功后解除 `PublicationGuard`，失败则由 guard 完整回滚。
 - `ThreadGroup::install_link_product(product)`：只允许资源阶段为 `Loading` 且尚无 link product 时调用；安装成功后仍为 `Loading`，并且只能由上述 publish 路径内部调用。
@@ -1723,7 +1756,7 @@ pub enum ApplicationEvent {
 }
 
 pub struct ReapResources {
-    private_images: Vec<SealedImage>,
+    private_images: Vec<OwnedImage>,
     system_leases: Vec<SystemDsoLease>,
     start_storage: Option<ApplicationStartStorage>,
     link_map: Vec<LinkMapEntry>,
@@ -1755,7 +1788,7 @@ pub struct ReapResources {
 | init/fini plan | S9 | S9 前随 session 丢弃 | `ThreadGroup`/system instance | fini 完成后随实例释放 |
 | argv/envp/auxv storage | S10 | 启动失败随 domain 回收 | `ThreadGroup` | 最后线程退出后 |
 
-对外 API 不返回 `&mut LoadedImageData`、裸 `AllocationId` 或可写的 `SessionDisposition`。调试和 metrics observer 只能观察事件副本，不能持有能跨阶段修改核心对象的引用。
+对外 API 不返回 `&mut MappedState`/其他可变 stage payload、裸 `AllocationId` 或可写的 `SessionDisposition`。调试和 metrics observer 只能观察事件副本，不能持有能跨阶段修改核心对象的引用。
 
 ### 11.15 ARM32 Thumb 远跳 veneer 的可选演进
 
@@ -1795,14 +1828,14 @@ Flash/XIP 是硬边界：调用指令若位于运行期不可写 Flash，loader 
 
 1. 引入 `TargetAddr/TargetRange/LoadError/LoadLimits`，底层 range/address 错误保持 stage-neutral，由阶段调用方补充 `LoadStage`。
 2. 实现 `SliceElfReader` 和带不可变快照契约的 `ElfReader`。
-3. 将 goblin 借用型结果转换成自有 `ParsedImage`，不在 `LoadedImage` 中保存 `Elf<'a>`。
+3. 将 goblin 借用型结果转换成自有 `ParsedImage`，不在 `StagedImage` 的 state payload 中保存 `Elf<'a>`。
 4. 在 allocation 前完成 ELF class/endian/machine、ARM/RISC-V `e_flags`、Thumb entry mode、program/dynamic feature policy、资源预算和 `ImageLayoutBuilder` 校验。
-5. 修正非零最低 vaddr 的 load bias、BSS 显式清零、segment gap、最大 `p_align`、entry X 权限、规范 `R/RX/RW` 权限和 checked arithmetic。
+5. 修正非零最低 vaddr 的 load bias、BSS 显式清零、segment gap、最大 `p_align`、canonical entry 最小指令跨度的 X 权限、规范 `R/RX/RW` 权限和 checked arithmetic。
 6. 实现 `ImageMemory`、非 `Copy` 的 `AllocationLease` 和 `MemoryMapper` 兼容 adapter；backend 对外只暴露精确逻辑范围，物理 padding 不得成为可写映像范围。
 7. 区分 owned 与 borrowed fixed：owned 失败释放 lease；fixed 首次修改后的失败必须进入 `Poisoned`，除非 backend 提供真实 snapshot/A-B/原生事务，不能把 bookkeeping release 称为内容回滚。
 8. 解析 REL/RELA 元数据并显式拒绝未启用的 RELR；按白名单校验 dynamic tag 与 `DT_FLAGS/DT_FLAGS_1` bit。
 9. relocation 在首次写入前完成 operation byte budget、目标排序、duplicate/overlap、权限、对齐、目标字宽和 relative result owner 校验；未知 relocation fail closed。
-10. 先 prepare granule/MPU-slot/alias-aware protection 与 cache plan，再 batch apply；记录请求范围和实际 `AppliedProtection`，平台不能提供所声明的 cache scope 时失败。
+10. 先 prepare granule/MPU-slot/alias-aware protection 与 cache plan，再 batch apply；记录请求范围和实际 `ProtectionRecord`，平台不能提供所声明的 cache scope 时失败。
 11. `load_elf()` 改为调用 `ImageLoader`，并在解除 rollback authority 前完成所有可失败的 mapper install 准备。
 12. 保留 ET_EXEC fixed mapper 测试，并明确 AArch64 等当前未接入架构是支持项还是范围缩减。
 
@@ -1817,7 +1850,7 @@ Flash/XIP 是硬边界：调用指令若位于运行期不可写 Flash，loader 
 - 非法 `p_align`
 - offset/vaddr 溢出
 - W+X
-- entry 不在 X segment
+- canonical entry 的最小指令跨度不完整位于 X segment
 - relocation 越界/未对齐
 - duplicate/overlap relocation target、映像外 relative result 和 operation/metadata 峰值预算超限
 - 未知 relocation
@@ -1826,7 +1859,7 @@ Flash/XIP 是硬边界：调用指令若位于运行期不可写 Flash，loader 
 - owned 映像任意 pre-commit 故障均 exactly-once 释放；modified fixed 故障进入 `Poisoned`
 - commit 后不再调用可能失败的步骤，且只有持有 lease 的 committed owner 能公开 entry
 
-ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须证明真实 relocation 被消费；现有 RISC-V64 自包含 `ET_DYN`、ET_EXEC 和 QEMU 测试作为兼容回归也必须继续通过，但不再决定 Phase 1 的首发架构。Phase 0 的 fuzz target/corpus、逐调用 fault injection 和真实 QEMU oracle 全部属于合入门，不能只列为后续建议。
+ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须证明真实 relocation 被消费；现有 RISC-V64 自包含 `ET_DYN`、ET_EXEC 和 QEMU 测试作为兼容回归也必须继续通过，但不再决定 Phase 1 的首发架构。Phase 0 的 `kernel/loader/fuzz/loader_fuzz.rs`/`fuzz/corpus`、逐调用 fault injection 和真实 QEMU oracle 全部属于合入门，不能只列为后续建议；GN 的 `check_loader` 与 `check_loader_host` 必须确定执行 corpus，持续 fuzz 环境则以 `cfg(fuzzing)` 调用同一入口。
 
 ### 12.2 Phase 0.5：冻结 `DynamicLinker` 架构
 
@@ -1892,7 +1925,7 @@ ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须证明真实 relocation 被�
 
 - `VfsElfReader`
 - `FlatImageMemory`
-- ARM `arch/*/cache.rs` 指令缓存服务（`sync_instruction_cache`）
+- ARM `arch/*/cache.rs` 指令缓存服务与 `CodeCache::prepare/synchronize` adapter
 - `SystemLibraryPaths`
 - `ApplicationArtifactResolver`
 - `SystemDsoRegistry`
@@ -2026,7 +2059,7 @@ app.elf
 - S0 为 `ArtifactIdentity` 增加签名、hash、manifest、allowlist 和 ABI generation。
 - S1/S4 固化产品 `ArtifactPolicy`，构建期与加载期双重拒绝 W+X、TEXTREL、可执行栈和未支持 dynamic feature。
 - S7 固化 `RelocationPolicy` 审计记录，证明每个 `P` 的 owner/range 与每个 `S` 的 scope/control-target 判定。
-- S8 发布 `AppliedProtection`，准确区分逻辑权限与平台实际执行的权限，不能把 `LogicalOnly` 升格为隔离证据。
+- S8 发布 `ProtectionRecord`，准确区分逻辑权限与平台实际执行的权限，不能把 `LogicalOnly` 升格为隔离证据。
 - S2–S9 为 allocation/permit/lease/publication 增加全覆盖故障注入和 metrics。
 - S9 为 `LinkMapEntry` 增加 build-id、精确 segment 和崩溃符号化信息。
 - S11 为 `ReapResources` 增加 quiescence evidence，不能证明安全时把 system instance 转为 cached 而不是释放。
@@ -2160,7 +2193,7 @@ C17 是 Phase 0.5 的合入门。到此 loader 核心可在 host 上走完 S0–
 | C20 `kernel: add versioned application start and exit ABI` | `kernel/header` | `ApplicationHandle/BlueOsAuxvEntry/BlueOsFunctionPlan/BlueOsApplicationStartInfo`，追加式 `ApplicationLaunch/InitComplete/BeginExit/FinishExit` syscall 编号（`ApplicationLaunch` 携带 path/argv/envp，约定 handler 侧 copy-in） | C/Rust layout、32/64 位 `struct_size`、旧 syscall 编号和旧静态启动 ABI 不变 |
 | C21 `librs: add ARM32 blueos_scrt1 and preserve static startup` | `librs`/SDK build | Thumb `blueos_scrt1::_start`、动态 `__librs_start_main` 声明和独立 static start adapter | Thumb C hello PIE 为 `ELFCLASS32 + EM_ARM + ET_DYN + PT_DYNAMIC + DT_NEEDED libc.so.1` 且无 `PT_INTERP`；入口 bit 0/栈对齐正确，现有 shell/kernel image 仍启动（shell 的 dynamic_app 迁移推迟到 C29） |
 | C22 `kernel: add positional VFS reads for executable artifacts` | `kernel/vfs` | `File::len/read_at/read_exact_at`，保持共享 offset 不变 | 并发 positional read、短读/EOF/IO error；现有 read/lseek 语义不变 |
-| C23 `kernel: implement loader adapters and ARM code-cache service` | `kernel/application/adapters` + `kernel/application/thread_group/adapters` + `kernel/arch` | 通用 `VfsElfReader/SystemLibraryPaths`、模型特有 `FlatImageMemory/ApplicationArtifactResolver`、ARM `arch/*/cache.rs` 的 `sync_instruction_cache`；实现固定路径 resolve、allocation+offset 访问、cache capability、DSB/ISB | adapter contract suite 与 host fake adapter 共用；无 cache 的 MPS2 明确报告能力且执行 barrier，cache-enabled 板缺维护实现时拒绝执行新代码 |
+| C23 `kernel: implement loader adapters and ARM code-cache service` | `kernel/application/adapters` + `kernel/application/thread_group/adapters` + `kernel/arch` | 通用 `VfsElfReader/SystemLibraryPaths`、模型特有 `FlatImageMemory/ApplicationArtifactResolver`、ARM `arch/*/cache.rs` 的 prepared cache adapter；实现固定路径 resolve、allocation+offset 访问、cache requirements/capability、DSB/ISB | adapter contract suite 与 host fake adapter 共用；prepared token 必须保持全部 X range；无 cache 的 MPS2 明确报告能力且执行 barrier，cache-enabled 板缺维护实现时拒绝执行新代码 |
 | C24 `kernel: add system DSO registry permits and leases` | `kernel/application/thread_group` | `DsoArtifact/SystemDsoInstance/SystemDsoState/SystemDsoRegistry/SystemDsoLease/SystemDsoLoadPermit`；实现 begin/wait/publish/fail/release | 两个并发请求只有一个 permit；失败唤醒 waiter 且 generation 不混淆；lease Drop 不执行 fini |
 | C25 `kernel: add the single ApplicationManager and thread-group backend` | `kernel/application` | `ApplicationManager/ApplicationRegistry/ApplicationInstance/ApplicationLaunchRequest/ApplicationState/ApplicationQuota/ApplicationEventQueue/ThreadGroupBackend/ThreadGroup`；实现 handle table、状态转换和 backend 分派；`launch()` 内核内部可直呼（boot 自举装载 shell），syscall handler 复用同一入口 | 全局锁外执行 fake slow prepare；Process 请求稳定返回 unsupported；状态机非法转换失败 |
 | C26 `kernel: publish linked images into ThreadGroup` | `kernel/application/thread_group` | `ApplicationLoader/ApplicationStartStorage/ReapResources`；实现 `link_application/install_link_product/publish_relocated/build start storage` | S0–S9 使用真实 VFS/memory/registry adapter；发布前故障不留下 ThreadGroup/link map/lease，start-info 指针稳定 |
@@ -2193,7 +2226,7 @@ C29 是首个真正可运行里程碑。C18–C21 可以与 C11–C17 后半段�
 | C38 `librs: expose NOW-local dl APIs with deferred close` | `librs`/SDK + ARM32 fixtures | 导出 `dlopen/dlsym/dlerror/dlclose`，执行 runtime init plan，维护线程局部错误；重复 open/close 计数和 `LogicallyClosed`，映像延迟到 ThreadGroup 退出回收 | `qemu_mps2_an385` 上插件 load/lookup/call、依赖 ctor、嵌套 dlopen、并发同库、错误 symbol、线程独立 dlerror、stale handle 与退出统一 fini/reap 全部通过 |
 | C39 `runtime: enforce signed artifact manifests and ABI policy` | build/install/kernel | 扩展 `ArtifactIdentity/ArtifactRequest/ApplicationArtifactPolicy`，加入签名、hash、allowlist、最低 kernel/librs ABI 和 artifact generation | 安装期与加载期双重校验、篡改/降级/错误模型/ABI 回滚用例；运行期打开不能绕过应用启动准入 |
 | C40 `runtime: harden registry concurrency and quiescence` | kernel application | `QuiescenceEvidence/RegistryGeneration/RetryPolicy`；实现启动及运行期并发失败重试、cached fallback 和安全卸载判定 | OOM/ctor failure/依赖环/反复启动退出/回调与 TLS destructor 保活压力测试 |
-| C41 `runtime: audit hardening and publish diagnostics` | loader + kernel arch/debug | 扩展 `ArtifactPolicy/RelocationPolicy/AppliedProtection/LinkMapEntry/LoadMetrics`；发布 policy 判定、实际权限结果、build-id 崩溃符号化和逐阶段 metrics | W+X/TEXTREL/可执行栈/越权 relocation 恶意 fixture；`LogicalOnly/HardwareEnforced` 不混淆；PC→image+offset 精确定位和时延/RAM 预算 |
+| C41 `runtime: audit hardening and publish diagnostics` | loader + kernel arch/debug | 扩展 `ArtifactPolicy/RelocationPolicy/ProtectionRecord/LinkMapEntry/LoadMetrics`；发布 policy 判定、实际权限结果、build-id 崩溃符号化和逐阶段 metrics | W+X/TEXTREL/可执行栈/越权 relocation 恶意 fixture；`LogicalOnly/HardwareEnforced` 不混淆；PC→image+offset 精确定位和时延/RAM 预算 |
 | C42 `release: add ABI, OTA and address-space simulation gates` | build/CI/SDK | SONAME/export ABI diff、A/B compatibility 检查和双模拟 address-space backend | 活跃旧 DSO 不被覆盖；回滚 ABI 检查；相同 artifact 可共享而 load bias/RW/lease/link map 不共享；只验证未来接口，不宣称已实现隔离 |
 
 ### 13.6 提交纪律与暂缓项

@@ -389,7 +389,7 @@ CHRE 的分层尤其值得避免误读：AP 侧 `ContextHubService` 通过 HAL �
 | 平台适配（通用） | `application/adapters/{vfs_reader,system_library_paths}.rs`；指令缓存维护下沉为 `arch/*/cache.rs` 通用 API，不设独立 adapter 文件 | 只依赖 VFS、系统路径策略与架构能力，与执行模型无关，thread_group 与未来 process 后端共用；`Adapter` 与执行模型 `Backend` 不混用 |
 | 平台适配（模型特有） | `thread_group/adapters/{flat_memory,artifact_resolver}.rs`；`FlatImageMemory`、`ApplicationArtifactResolver` | 依赖共享地址空间映射与 `SystemDsoRegistry` 实例状态；未来由 `ProcessImageMemory` 与每进程 resolver 替换 |
 | 未来进程后端 | `application/process/{backend,process,exec,address_space,initial_stack}.rs`；`ProcessBackend`、`Process`、`AddressSpace`、`ProcessImageMemory` | Tock `Process`/MPU、Asterinas program loader/VMAR、Linux `exec` 与 initial stack |
-| 单映像装载 | `blueos_loader::{address,identity,reader,memory,error}` 与 `image/{parser,metadata,layout,policy,loaded}`；`ImageLoader`、`ElfReader`、`ImageLayout`、`LoadedImage` | Zephyr LLEXT loader、Relink loader/image/ELF layout、Linux/musl segment loader |
+| 单映像装载 | `blueos_loader::{address,identity,reader,memory,error}` 与 `image/{parser,metadata,layout,loaded}`；`ImageLoader`、`ElfReader`、`ImageLayout`、`StagedImage` | Zephyr LLEXT loader、Relink loader/image/ELF layout、Linux/musl segment loader |
 | 多映像链接 | `dynamic_linker/{linker,session,context,dependency,scope,symbol,lifecycle}.rs`；`DynamicLinker`、`LinkSession`、`LinkContext` | musl ldso 和 Relink linker/context/session；`Core` 不增加职责信息，故不用 `DynamicLinkerCore` |
 | 架构重定位 | `relocation/{model,arch/*}.rs`；`ArchRelocator` | Linux、Zephyr、Relink 都用 `arch` 隔离 ISA relocation；`arch` 是行业通用缩写，可以保留 |
 | libc 应用级状态 | `librs/{start,application_context,auxv,pthread,tls}.rs`；`LibcApplicationContext`、`PthreadTcb` | musl startup/pthread/TLS 分层；加 `Libc` 是为避免与 Android `Context` 或内核控制面混淆 |
@@ -412,7 +412,7 @@ CHRE 的分层尤其值得避免误读：AP 侧 `ContextHubService` 通过 HAL �
 | `ApplicationContext`、`app_context.rs` | `LibcApplicationContext`、`application_context.rs` | 明确这是 libc 所有权上下文；目录 `librs/` 已限定文件层级，无需在文件名重复 `libc` |
 | `AppScrt1.o` | `blueos_scrt1.o` | 保留标准 `Scrt1` 启动对象语义，同时明确 BlueOS 定制 entry+arg ABI |
 
-还需遵守三条消歧规则：第一，`LinkDomainId` 只表示一个 `LinkContext` 的符号命名空间，`ProtectionDomainId` 只表示硬件访问控制域，禁止用裸 `domain` 同时指代二者；线程组参数统一叫 `group`/`group_id`。第二，`Runtime` 只用于 libc、语言运行时或确实发生在运行期的数据，例如 `RuntimeImageMetadata`，不用于 manager、loader 或 group。第三，`Core` 只在存在同名外围层且确实表示可独立复用核心时使用；本方案没有这种必要，统一采用 `DynamicLinker` 和 `LoadedImageData`。
+还需遵守三条消歧规则：第一，`LinkDomainId` 只表示一个 `LinkContext` 的符号命名空间，`ProtectionDomainId` 只表示硬件访问控制域，禁止用裸 `domain` 同时指代二者；线程组参数统一叫 `group`/`group_id`。第二，`Runtime` 只用于 libc、语言运行时或确实发生在运行期的数据，例如 `RuntimeImageMetadata`，不用于 manager、loader 或 group。第三，`Core` 只在存在同名外围层且确实表示可独立复用核心时使用；本方案没有这种必要，统一采用 `DynamicLinker`，未发布单映像统一采用 `StagedImage` 与具体 `*State` payload。
 
 
 ## 3. 从参考项目提取的 RTOS 动态加载流程
@@ -698,7 +698,7 @@ kernel/kernel/src/application/        # 唯一的内核应用控制面入口
 
 `application` 只有一份顶层状态表和公共 API。`application/adapters/` 只放依赖内核通用能力（VFS、系统路径策略）的适配，与执行模型无关；`thread_group/adapters/` 只放依赖共享地址空间映射和 `SystemDsoRegistry` 实例状态的适配，未来由 `ProcessImageMemory` 与每进程 resolver 替换；指令缓存维护（`fence.i`、D-clean/I-invalidate）是架构服务，实现在 `arch/*/cache.rs`，`ApplicationLoader` 直接调用，不包装成独立 adapter 文件。当前构建不需要实现 `process/`，只编译 `thread_group/`；未来由唯一的内核配置源生成 `blueos_user_process`，在模块边界启用 `process/`，而不是用互斥 `cfg` 生成第二套 `ApplicationManager`。支持兼容 RTOS 应用的通用内核可以同时编入两个后端，并根据已签名 manifest/ABI note 中的 `ExecutionModel` 显式分派，不能只依据是否存在 `PT_INTERP` 猜测执行模型。
 
-当前 `load_elf(buffer, mapper)` 继续作为 static PIE、`ET_EXEC` 和既有测试的兼容入口，但内部改为调用 `ImageLoader`；动态应用由同一 crate 的 `DynamicLinker` 组合多个 `LoadedImage`。`blueos_loader` 的生产代码不得依赖待装入的 `librs/libc.so.1`；若现有 BUILD 依赖只服务于测试，应移到测试 target，避免 `DynamicLinker` 与 libc 形成 bootstrap 环。
+当前 `load_elf(buffer, mapper)` 继续作为 static PIE、`ET_EXEC` 和既有测试的兼容入口，但内部改为调用 `ImageLoader`；动态应用由同一 crate 的 `DynamicLinker` 顺序消费单映像 `StagedImage`，把 state/lease 吸收到 `LinkSession` 的 rollback log，成功后一次性移交给 committed link product。这样不会尝试同时保存多个各自借用同一 `&mut ImageMemory` 的 stage。`blueos_loader` 的生产代码不得依赖待装入的 `librs/libc.so.1`；若现有 BUILD 依赖只服务于测试，应移到测试 target，避免 `DynamicLinker` 与 libc 形成 bootstrap 环。
 
 ### 5.3 核心对象及所有权
 
@@ -707,7 +707,7 @@ kernel/kernel/src/application/        # 唯一的内核应用控制面入口
 - `DsoArtifactCatalog`：记录已验证的 SONAME、build-id、固定路径/包内身份、ABI note 和可复用解析元数据，不包含 load bias、可写状态或构造状态。当前可作为 `SystemDsoRegistry` 的内部层；未来可直接演进为系统级文件/页缓存。
 - `DsoInstanceRegistry`：记录某个 `LinkDomainId` 中真正映射并 relocation 后的 DSO 实例、依赖边、lease 和 link map。RTOS 当前只有一个共享的 system link domain，因此对外仍可称为 `SystemDsoRegistry`；未来每个进程各有 instance registry，不能把当前全局实例直接跨地址空间复用。
 - `ThreadGroup`：当前执行模型下的一次应用实例；拥有稳定 `LinkDomainId`、ABI profile、主线程与子线程集合、应用私有 `LinkContext`、资源配额和退出状态。它是管理与回收单位，不是 scheduler 的 `Thread`，也不是安全地址空间；未来进程后端以 `Process` 作为同级实例，不把 `ThreadGroup` 改名冒充进程。
-- `LoadedImage`：一个主程序或 DSO；拥有文件身份、目标地址宽度下的 load bias、每个 region、动态元数据和调试信息。核心只保存 `TargetAddr/TargetWord`，不得把目标地址直接表达为 loader 自身可解引用的 Rust 指针。
+- `StagedImage<'a, M, S>`：一个尚未发布的主程序或 DSO；绑定 rollback authority，并在 state payload 中拥有文件身份、目标地址宽度下的 load bias、每个 region、动态元数据和调试信息。核心只保存 `TargetAddr/TargetWord`，不得把目标地址直接表达为 loader 自身可解引用的 Rust 指针；成功后这些资源整体移交给 committed owner，不再保留第二种同义 wrapper。
 - `MemoryRegion`：绑定 `LinkDomainId/AddressSpaceHandle`，有明确目标虚拟地址范围、backing、最终逻辑 R/W/X 权限和释放方式；Drop 时可回滚尚未发布的装载。RTOS flat backend 可以把目标地址映射为当前可访问 RAM，未来 VM backend 则映射进指定进程页表。
 - 公共 `ApplicationState` 只暴露 `Loading → Running → Stopping → Terminated/Failed`。`S0`–`S10` 和 `LinkSession` 负责链接内部的 Parsed/Mapped/Relocated/Published/Initialized 阶段，避免把 loader 细节重复塞进查询 API；`ThreadGroup` 内部只保留禁止新线程、活动线程计数、fini 是否完成、资源是否已被 reaper 取走等回收所需不变量。
 - `SystemDsoLease`：由已提交的 `ThreadGroup` 或系统 DSO 依赖边持有；Drop 只触发 quiescence 尝试，不直接释放代码。
@@ -1166,7 +1166,7 @@ SONAME major 表示不兼容 ABI；同 major 内遵循 append-only 导出、已�
 - 用 `AllocationLease + PreparedImage + committed owner` 建立单映像事务所有权；owned 映像支持强回滚，borrowed fixed 修改后失败进入 `Poisoned`；Phase 0 不引入 `ThreadGroup`；
 - 畸形 ELF corpus、逐调用 fault injection 和 fuzz target。
 
-验收：非零最低 `p_vaddr`、带洞 segment、大 BSS、错误 `p_align`、越界/溢出、未知 relocation、非 X entry、故意 W+X、错误 ABI flag、重复 relocation、权限粒度冲突和事务中每个故障点都有确定结果；ARM32 fixture 必须证明真实 relative relocation 被消费，现有 RISC-V64 QEMU 自包含 `ET_DYN` 继续稳定运行，并保证 local commit 后不存在可失败步骤。详细 gate 以 [Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为准。
+验收：非零最低 `p_vaddr`、带洞 segment、大 BSS、错误 `p_align`、越界/溢出、canonical entry 最小指令跨度越出 X segment、未知 relocation、故意 W+X、错误 ABI flag、重复 relocation、权限粒度冲突和事务中每个故障点都有确定结果；ARM32 fixture 必须证明真实 relative relocation 被消费，现有 RISC-V64 QEMU 自包含 `ET_DYN` 继续稳定运行，并保证 local commit 后不存在可失败步骤。详细 gate 以 [Phase 0 详细实现方案](./dynamic-loading-phase0-implementation.md) 为准。
 
 #### 7.4.2 Phase 0.5：扩充 `blueos_loader` 并冻结 DynamicLinker 架构
 
@@ -1216,7 +1216,7 @@ SONAME major 表示不兼容 ABI；同 major 内遵循 append-only 导出、已�
 - 完成应用包签名、系统/应用 DSO allowlist、ABI note、SONAME/build-id 和 A/B 兼容门禁；
 - 审计共享 `libc.so.1` 的 allocator、stdio、cwd、环境、pthread 和 emutls 状态，按产品需求区分 system/thread/LibcApplicationContext ownership；
 - 完成并发启动锁、依赖环、OOM/故障注入、构造失败、线程退出与整组回收；把线程 PC、TLS destructor、atexit、信号/定时器/驱动回调、已登记函数指针和 DSO 依赖边纳入静默判定，无法证明安全时禁止释放 image；
-- 发布所有平台的 `AppliedProtection` 实际结果并完成 cache 正确性与实时性能测量；MPU/MMU/PMP 隔离仍作为独立后续演进，不属于本 Phase 完成门槛；
+- 发布所有平台的 `ProtectionRecord` 实际结果并完成 cache 正确性与实时性能测量；MPU/MMU/PMP 隔离仍作为独立后续演进，不属于本 Phase 完成门槛；
 - 交付 link map、崩溃符号化、结构化错误和每阶段耗时/内存计数。
 - 增加一次“未来 VM adapter”host 验证：用模拟的两个独立 address space 装载相同 DSO，确认可共享 artifact/只读 backing 元数据，但 load bias、RW/GOT、构造状态、lease 和 link map 保持实例级隔离；这不实现进程，却能防止 RTOS 代码重新耦合到全局地址空间。
 

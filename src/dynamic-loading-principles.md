@@ -52,7 +52,7 @@ section header 可以被裁掉，运行时仍能依靠 program header 和 `PT_DY
 | `p_flags` | 最终的 `PF_R/PF_W/PF_X` 权限 |
 | `p_align` | 文件偏移和虚址共同满足的对齐要求 |
 
-对于 `ET_DYN`，所有 `PT_LOAD` 保持同一个 load bias `B`，第一个运行时字节位于 `B + p_vaddr`。loader 把文件中的 `p_filesz` 字节复制到这里，再把尾部 `p_memsz - p_filesz` 字节清零；后者通常对应 `.bss`。`PT_LOAD` 之间的地址空洞不是可随意访问的对象。`e_entry` 同样是 ELF 虚址，实际入口为 `B + e_entry`，发布前必须验证它落在当前映像的可执行区域。
+对于 `ET_DYN`，所有 `PT_LOAD` 保持同一个 load bias `B`，第一个运行时字节位于 `B + p_vaddr`。loader 把文件中的 `p_filesz` 字节复制到这里，再把尾部 `p_memsz - p_filesz` 字节清零；后者通常对应 `.bss`。`PT_LOAD` 之间的地址空洞不是可随意访问的对象。`e_entry` 同样是 ELF 虚址，实际入口为 `B + e_entry`；发布前必须按架构规范化 entry，并验证最小指令跨度完整落在当前映像的可执行区域。
 
 其他 program header 主要提供附加语义，不应再次分配一份重复映像：`PT_DYNAMIC` 指出 dynamic table，`PT_GNU_RELRO` 标出重定位后收紧为只读的范围，`PT_TLS` 描述每线程 TLS 的初始化模板，`PT_GNU_STACK` 只声明栈权限。它们引用的文件或内存范围必须落入经过验证的文件范围或 `PT_LOAD` backing；如果以后支持 `PT_TLS`，每个线程的 TLS 实例由运行时另行分配，而不是直接把模板当成共享的可写 TLS。
 
@@ -238,7 +238,7 @@ S10 起  副作用边界：ctor 产生的外部副作用（I/O、线程等）不
 | `ThreadGroup` | 一次应用实例的资源寿命单位：主线程+子线程、私有映像、`LinkContext`、system DSO lease、启动信息、配额、退出码。**不是 `Thread` 的包装** | NuttX `task_group_s`、RT-Thread `rt_dlmodule` |
 | `ApplicationLoader` | 启动期装载/链接适配器：把 VFS/内存/cache/registry 能力接给 `DynamicLinker`，负责 publish 与回滚 | Relink 的 platform 适配层 |
 | `SystemDsoRegistry` | 工件目录（已验证元数据）与运行实例表（mapped/relocated 状态）分离；并发首装合并为一次事务；lease 保活；归零后静默检查才可卸载 | Tock 凭证与运行实例分离；NuttX/Zephyr module 表 |
-| `ImageLoader` | 单映像装载：S0–S4。`LoadedImage` 用 typestate 走 `Mapped→Runtime→Relocated→Sealed`，转换方法消费旧对象 | Zephyr LLEXT loader；Relink loader |
+| `ImageLoader` | 单映像装载：S0–S4。`StagedImage<'a, M, S>` 把 rollback authority 与 `Mapped→Runtime→Relocated→Sealed` payload 绑定，转换方法消费旧对象 | Zephyr LLEXT loader；Relink loader |
 | `DynamicLinker` | 多映像链接：S5–S9。依赖图/作用域/符号/重定位/生命周期计划，`LinkSession` 事务（rollback log） | musl `dynlink.c`；Relink `Linker`+`session` |
 | traits（`ElfReader`/`ImageMemory`/`CodeCache`/`ArchRelocator`） | 链接核心与内核的唯一触点：核心只持 `TargetAddr`+`AllocationId`，不解引用裸指针 | `rust-elfloader` 的 trait 分离；Relink input/memory/os |
 | `libc.so.1` / `blueos_scrt1` | 动态应用运行时：`_start(ApplicationStartInfo*)` → `__librs_start_main` 初始化、跑 init plan、进 `main`、协调退出 | musl `Scrt1.o` 语义（定制 ABI） |
@@ -294,7 +294,7 @@ S10 起  副作用边界：ctor 产生的外部副作用（I/O、线程等）不
 | 依赖与符号域 | SONAME 与文件身份双重去重；应用 scope 与 system scope 分离；system DSO 只从冻结导出集解析 | 私有 DSO 不能冒充 system DSO；应用符号不能 interpose libc 自身 relocation；不向应用发布完整内核符号表 |
 | 重定位写入 | `RelocationPolicy` 对每条记录验证 owner、`P` 的 allocation/range/width/alignment、addend 和目标字宽溢出；类型采用架构白名单 | relocation 只能通过 `ImageMemory` 的已验证位置写入；未知类型、越界、未对齐、缺失 strong symbol 全部 fail-closed |
 | 重定位控制流 | `JUMP_SLOT`、入口和 init/fini 函数地址必须来自允许 scope，并落在对应 owner 的 X region；undefined weak=0 是否允许由 artifact profile 明确决定；符号类型和架构函数地址规则由 `ArchRelocator` 校验 | data/BSS/gap/内核普通地址不能成为 loader 写入的控制流目标；该检查只覆盖 relocation 和生命周期元数据，不宣称完整 CFI |
-| 映像权限与 cache | 映像在 S9 前不可见；全部写入结束后按 `SealPlan` 收为 RX/R/RW+NX，RELRO 去 W，随后完成 D/I-cache 同步再发布 | `AppliedProtection` 必须区分 `LogicalOnly` 与 `HardwareEnforced`，不能把逻辑权限谎报为硬件隔离；NOW 绑定，不保留运行期可写 lazy PLT |
+| 映像权限与 cache | 映像在 S9 前不可见；全部写入结束后按 `SealPlan` 收为 RX/R/RW+NX，RELRO 去 W，随后完成 D/I-cache 同步再发布 | `ProtectionRecord` 必须区分 `LogicalOnly` 与 `HardwareEnforced`，不能把逻辑权限谎报为硬件隔离；NOW 绑定，不保留运行期可写 lazy PLT |
 | 发布与回收 | typestate、rollback log、原子 publish、ThreadGroup 所有权、system DSO lease、quiescence 后卸载 | 读者只见旧快照或完整新快照；最后执行流、回调、TLS destructor 和 lease 失效前不得释放映像 |
 
 重定位目标校验不是控制流完整性：同一 ELF 内已被静态链接器解析的直接分支、运行期函数指针、返回地址和应用自行计算的 `jalr` 目标都不出现在 dynamic relocation 表中。因此当前控制能防止 loader 替应用制造非法跳转，不能阻止同特权 native 代码运行后自行访问任意系统地址。
