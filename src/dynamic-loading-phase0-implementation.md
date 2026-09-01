@@ -12,6 +12,17 @@ Phase 0 的 P0-C00–P0-C12 功能基线已在 `kernel` 仓库的 `feat/loader-p
 
 实现中已经发现旧方案把“static PIE”错误地当作启动方输入，因此 P0-C04 同时修正了 P0-C01–P0-C03 的类型契约：公开请求现在只有 `ExpectedElfType::{Dyn, Exec}`，自包含性在扫描 `PT_DYNAMIC` 后由 feature policy 判定。不过，2026-08-27 对代码、总实施计划和 Relink `1928b38` 的交叉评审又发现了事务提交、fixed 映像失败语义、ABI 准入和真实 protection/cache 能力等设计缺口。因此 P0-C00–P0-C12 只能称为**可运行基线**，不能再称为 Phase 0 已最终完成。
 
+### 0.0.1 P0-C10 门禁在 `loader_and_linker` 分支补齐（2026-09-01）
+
+`feat/loader-phase0` 已删除，后续工作以 `loader_and_linker` 为主线。该分支曾回退到双路径状态——`load_elf()` 入口先做整文件 goblin `Elf::parse`，ET_EXEC 仍走旧 `build_memory_layout` + `copy_content_to_memory`——已于 2026-09-01 补齐：
+
+- `load_elf()`/`load_elf_from_reader()` 入口只做 20 字节前缀 peek（EI_CLASS/EI_DATA/e_machine），由 mapper 模式决定期望的镜像类型（Allocated→ET_DYN，Fixed→ET_EXEC），再交给 admit 按 profile 复验；
+- ET_EXEC 与 ET_DYN 走同一条 `ImageLoader` 管线（admit→inspect→plan→allocate→map→decode→relocation→cache→seal）；`AllocationRequest` 通过 `Placement::{Anywhere, Fixed(TargetRange)}` 表达放置方式，fixed 的统一 load bias 公式自然得出 0；
+- `MemoryMapper` 的 Fixed 模式以 `ImageMemory` 身份借用静态 region（写前整段校验、不占用堆存储），`Elf::parse`/`build_memory_layout`/`copy_content_to_memory` 等旧路径全部删除，goblin 仅保留常量；
+- 集成测试改用基于 seek 的 `SemihostingElfReader`（实现公开的 `ElfReader` trait），不再整文件缓冲，debug 构建（`-Cdebuginfo=full` 下约 4.1 MB 的测试映像）的 loader 集成测试首次全部可运行。
+
+验证：qemu_riscv64 release/debug 单元（11 个）与集成（4 个）测试、esp32c3（seeed_xiao_esp32c3）ET_EXEC 集成测试 7 个全部通过；`grep -rn "build_memory_layout\|copy_content_to_memory\|Elf::parse" kernel/loader/src/ kernel/loader/tests/` 仅剩测试 fixture 自检与 host 侧恶意样本生成器两处合法用途。
+
 | 阶段 | Commit | 已交付结果 |
 | --- | --- | --- |
 | P0-C00 | `8b70ca8` | host regression fixture 和 GN test target |
