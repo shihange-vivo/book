@@ -1863,6 +1863,9 @@ ARM32 `R_ARM_RELATIVE`/`DT_REL` host fixture 必须证明真实 relocation 被�
 
 ### 12.2 Phase 0.5：冻结 `DynamicLinker` 架构
 
+逐类型、所有权、失败语义和 C11–C17 子提交的开工清单见
+[Phase 0.5 详细实施方案](./dynamic-loading-phase05-implementation.md)。
+
 #### 实现目标
 
 在同一 `blueos_loader` crate 中形成可单测的多 DSO 核心，但暂不接入完整内核启动。
@@ -2171,6 +2174,9 @@ Phase 0 的 commit hash、逐提交动机和测试明细不在此处重复维护
 `P0-C15` 才是 Phase 0 的合入门。此时还没有 `DT_NEEDED`，但 S0–S4、relative S7 和 S8 已经由真实类型边界串起来，且 local commit 后不存在可失败步骤。
 
 ### 13.2 Phase 0.5：`DynamicLinker` 提交序列
+
+本节保留跨阶段总览；实际开发和验收以
+[Phase 0.5 详细实施方案](./dynamic-loading-phase05-implementation.md)为准。
 
 | 提交 | 仓库/子树 | 实现的数据结构和方法 | 本提交必须通过的 gate |
 | --- | --- | --- | --- |
