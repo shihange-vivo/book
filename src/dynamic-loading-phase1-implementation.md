@@ -1342,6 +1342,7 @@ QEMU artifact 验证。
 - [ ] scheduler cleanup 只投递事件，reaper 负责最终释放；
 - [ ] 缺依赖、缺符号、ABI 不匹配和所有 fault point 不破坏 Ready registry；
 - [ ] C hello、argv/envp/auxv、heap、IO、BSS、weak、function/data symbol、ctor 通过；
+- [ ] 使用同一目标 profile 由 `clang`/`clang++` 分别生成最小 C/C++ `ET_DYN` 动态库，并以真实产物完成 VFS 读取、装载、依赖解析、重定位、seal、`extern "C"` 导出调用以及 fini/release 全链路验证；C++ fixture 显式禁用当前 profile 尚不支持的 exception/RTTI，不能以静态 ELF gate 通过代替实际运行；
 - [ ] pthread emutls 隔离和 destructor 通过；
 - [ ] 正常退出在最后线程前不释放 image；
 - [ ] 最后 system lease 后产生可审计的 unload 或 KeepCached 结论；
