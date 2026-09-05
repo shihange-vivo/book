@@ -28,6 +28,7 @@
 * [Dynamic loading Phase 0 implementation](./dynamic-loading-phase0-implementation.md)
 * [Dynamic loading Phase 0.5 implementation](./dynamic-loading-phase05-implementation.md)
 * [Dynamic loading Phase 1 implementation](./dynamic-loading-phase1-implementation.md)
+* [Dynamic loading Phase 2 implementation](./dynamic-loading-phase2-implementation.md)
 
 ---
 
