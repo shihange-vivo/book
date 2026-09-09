@@ -33,6 +33,33 @@ Phase 2 的完成标志不是“其余架构的 relocator 类型已经存在”�
 依赖图、符号 owner、构造/析构顺序和整组回收结果；每种允许的 relocation 还必须有
 真实工具链产物和精确 golden gate。
 
+> **2026-09-09 实现状态。** 本文第 1 节保留 2026-09-05 的历史基线，不能再当成当前
+> 代码说明。当前已完成 C30/C31 的主链路：manifest-closed package、requester-aware
+> private/system resolver、跨映像 scope、SCC lifecycle、system DSO registry ownership、
+> `Initializing → Ready` 批量发布、counted dependency lease、quiescent system fini/unload、
+> group reap 和多 DSO emutls 都已接入真实 ELF/QEMU。并发 gate 会同时启动两个复杂应用，
+> 验证同一 system DSO 的首次装入/复用和最后 lease 释放。
+>
+> 当前运行验证如下：
+>
+> | profile | 当前状态 |
+> | --- | --- |
+> | Thumb v7-M soft-float / MPS2 | 多 DSO、scope、cycle、并发、emutls 通过；board `check_all` 通过 |
+> | Thumb v8-M hard-float / MPS3 | 同一动态 scope 纵向门禁通过 |
+> | RV64 / RV32 | 同一动态 scope 纵向门禁通过 |
+> | AArch64 | producer、ELF gate 和 backend 已接入；动态运行门禁仍未闭环 |
+>
+> 这意味着 loader 已经从 Phase 1 的单 app/libc 演示进入可工作的多 DSO 运行时，但
+> **Phase 2 尚不能整体标记完成**。主要缺口仍是 AArch64 运行闭环、硬件级页权限/W^X/
+> RELRO（当前 flat image backend 只能记录逻辑权限）、完整 fault-injection/golden 矩阵
+> 以及 C++ 纵向 fixture。`dlopen/dlsym/dlclose`、原生 ELF TLS、签名与 OTA 仍按本计划
+> 留在后续阶段。
+>
+> 本轮还收口了三项会干扰门禁判断的问题：测试映像不再无条件启动 bootstrap shell；
+> QEMU action 使用有界 Ninja pool，避免多个 TCG 实例争抢宿主机后触发假 inactivity
+> timeout；动态 ELF 的最大页对齐固定为 4 KiB，避免小 DSO 因 64 KiB segment 间距在
+> 4 MiB SRAM 的 MPS3 上并发装载 OOM。
+
 ## 1. 当前基线判断
 
 ### 1.1 已经存在、应直接复用的链接核心
