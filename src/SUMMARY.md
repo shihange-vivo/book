@@ -25,6 +25,7 @@
 * [Dynamic loading principles and architecture](./dynamic-loading-principles.md)
 * [Dynamic loading implementation overview](./dynamic-loading-implementation-overview.md)
 * [Dynamic loading implementation plan](./dynamic-loading-implementation-plan.md)
+* [Dynamic loading ordinary namespace replacement plan](./dynamic-loading-namespace-replacement-plan.md)
 * [Dynamic loading Phase 0 implementation](./dynamic-loading-phase0-implementation.md)
 * [Dynamic loading Phase 0.5 implementation](./dynamic-loading-phase05-implementation.md)
 * [Dynamic loading Phase 1 implementation](./dynamic-loading-phase1-implementation.md)
