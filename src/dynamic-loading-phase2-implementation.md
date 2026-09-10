@@ -1,5 +1,11 @@
 # BlueOS Dynamic Loading Phase 2 详细实施计划
 
+> **历史方案提示（2026-09-10）：** 本文中的 manifest-closed package、
+> `PackageArtifactResolver`、`blueos_app_package.gni` 和 package catalog 已被
+> [普通 namespace 替换方案](./dynamic-loading-namespace-replacement-plan.md)取代并从代码中删除。
+> 本文仍用于记录 Phase 2 的链接、scope、生命周期和跨架构设计；涉及依赖发现、路径搜索、
+> 系统 registry key 与 boot 安装流程时，应以上述替换方案和当前源码为准。
+
 本文是 Phase 2 的直接开发清单。它以 2026-09-05 的以下代码为基线：
 
 - `kernel@e267a66`：Phase 1 的 `DynamicLinker`、应用控制面、system DSO registry、

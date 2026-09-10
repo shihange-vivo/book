@@ -16,6 +16,20 @@
 
 本文中的“普通 namespace”是路径搜索范围和已加载对象集合，不是安全边界。当前共享特权地址空间、系统 DSO 生命周期和 ELF 格式安全检查仍保持不变。
 
+### 1.1 实现状态（2026-09-10）
+
+本方案的运行期替换已经落地：
+
+- `ApplicationService` 在 `spawn()` 入口捕获 pwd，并把绝对或相对启动参数规范化为稳定的 root path；
+- `NamespaceLoadPlanner` 从真实 VFS ELF 做只读 BFS 预扫描，冻结 path、snapshot、identity、`DT_NEEDED` 和 dependency edge；
+- `NamespaceArtifactResolver` 在映射前原子获取完整 system path-key 闭包，之后只重放 plan，不在链接中途搜索目录或逐个申请系统库；
+- `SystemDsoRegistry` 使用 `(LinkDomainId, canonical system path)` 作为 key，不再依赖 ELF 的 `DT_SONAME`；
+- strict package catalog、package resolver、manifest 生成/校验脚本和 `blueos_app_package` 模板已经删除；
+- `blueos_app_bundle` 与 boot seed catalog 只描述“构建产物安装到哪个 VFS 路径”，不参与运行期解析；
+- 构建 gate 允许无依赖的 PIE 和无 SONAME 的 DSO；`libscope_sys` 已改成无 SONAME 的系统 DSO 纵向 fixture。
+
+当前 MPS2 QEMU 门禁已经覆盖相对路径启动、私有库名称查找、菱形/循环依赖、共享系统库并发首次加载、无 SONAME 系统库的发布/复用/回收，以及 scope、init/fini 和 emutls。本文后续保留设计理由、接口约束和未完成的 `dlopen/dlclose` 扩展边界。
+
 ## 2. 本阶段范围
 
 ### 2.1 支持
@@ -245,16 +259,12 @@ pub struct PlannedImage {
     identity: ArtifactIdentity,
     /// 已解析的规范化文件路径。
     path: String,
-    /// ELF 实际声明的 DT_SONAME；允许为 None。
-    declared_soname: Option<DependencyName>,
-    /// 该映像在本次 namespace 中首先通过什么请求被找到。
-    lookup_key: LibraryLookupKey,
-    ownership: ImageOwnership,
-}
-
-pub enum LibraryLookupKey {
-    Name(DependencyName),
-    Path(String),
+    /// root 或 dependency。
+    role: ArtifactRole,
+    /// 命中 system catalog 时为规范化 catalog path，否则为 None。
+    system_key: Option<DependencyName>,
+    /// ELF 实际声明的可选 DT_SONAME 和全部 DT_NEEDED。
+    scanned: ScannedArtifact,
 }
 ```
 
@@ -278,7 +288,7 @@ libfoo.so
 
 依赖 DSO 仍要求存在 `PT_DYNAMIC`。当前缺少 `PT_DYNAMIC` 时使用 `DT_SONAME` 构造错误上下文的做法应改成普通的 missing dynamic-table/BadElf 错误，避免继续暗示 SONAME 是必需项。
 
-`DependencyGraph` 已使用 `Option<DependencyName>` 保存 SONAME，主体结构不需要改为必填。保留 identity 优先的去重规则即可。
+`DependencyGraph` 已使用 `Option<DependencyName>` 保存 SONAME，主体结构不需要改为必填。planner 先按规范化路径去重，再按 snapshot identity 合并路径别名；linker 继续保留 identity 优先、SONAME 冲突次之的规则。
 
 ## 6. 系统 catalog 和 registry key
 
@@ -326,10 +336,11 @@ libc.so.1
 
 `LoadPermit` 已经标识具体 registry slot。`ApplicationLoader::hand_off()` 不应再通过 published descriptor 的 SONAME 匹配 permit，而应使用 resolver 保存的 `(system key, artifact identity, permit)`，在已发布 system candidate 中按 `ArtifactIdentity` 配对。系统 DSO 没有 SONAME 时也能正确发布。
 
-registry 中现有的 `dependency_names` 相应改为 `dependency_keys`。日志同时输出 catalog key/path 和可选 SONAME：
+registry 中现有的 `dependency_names` 相应改为 `dependency_keys`。系统库生命周期日志输出 catalog path，link map 仍单独输出 ELF 的可选 SONAME：
 
 ```text
-DSO_LOAD key=/system/lib/libc.so.1 soname=-
+DSO_LOAD path=/system/lib/libscope_sys.so.1
+LINK_MAP owner=7 soname=- bias=...
 ```
 
 ## 7. 运行期依赖预扫描
@@ -436,25 +447,28 @@ registry.acquire_batch(namespace.system_domain(), &plan.system_keys)
 ```rust
 pub struct NamespaceArtifactResolver {
     plan: NamespaceLoadPlan,
-    system_loads: Vec<(SystemLibraryKey, LoadPermit)>,
-    system_imports:
-        Vec<(SystemLibraryKey, SystemDsoLease, PublishedImageDescriptor)>,
-    candidate_claims: Vec<SystemCandidateClaim>,
-    import_claims: Vec<SystemImportClaim>,
+    batch_loads: Vec<(DependencyName, LoadPermit)>,
+    batch_imports:
+        Vec<(DependencyName, SystemDsoLease, PublishedImageDescriptor)>,
+    candidates: Vec<SystemCandidateClaim>,
+    leases: Vec<SystemDsoLease>,
+    imports: Vec<SystemImportClaim>,
+    opened_private: Vec<ArtifactIdentity>,
 }
 ```
 
-这里不再保存：
+这里不再保存或执行：
 
 ```text
 namespace
 system_catalog
 registry
-private_images
 pending
+目录搜索
+逐项 acquire/wait
 ```
 
-目录搜索和系统并发决定已经由 planner/orchestrator 完成。resolver 收到 `DependencyRequest` 后只查找 plan 中的 edge，并返回对应 reader 或 Ready descriptor。
+目录搜索已经由 planner 完成，batch acquire 在 resolver 构造阶段、linker 分配内存前一次性完成。resolver 收到 `DependencyRequest` 后只查找 plan 中的 edge，并返回对应 reader 或 Ready descriptor。`opened_private` 仅用于让同一 private identity 的诊断日志只输出一次，不参与解析策略。
 
 同一 system key 的多个 dependency edge 只消费一个 permit/lease；额外 edge 复用同一 claim。resolver 成功后把 permit 和 lease 交给现有 publisher/`ThreadGroup`，失败时由 Drop 自动取消或释放。
 
@@ -477,11 +491,7 @@ Ready/Failed
 ## 9. 启动主流程
 
 ```rust
-pub fn load_application(
-    &self,
-    input_path: &str,
-    group: &ThreadGroup,
-) -> LoadResult<LinkProduct<KernelLinkReceipt>> {
+pub fn spawn(&self, input_path: &str, ...) -> Result<ApplicationHandle, ...> {
     let namespace = ApplicationNamespace::from_launch_path(
         input_path,
         current_pwd_snapshot(),
@@ -489,24 +499,19 @@ pub fn load_application(
         self.system_domain,
     )?;
 
-    let plan = NamespaceLoadPlanner::new(&namespace, self.catalog)
-        .scan()?;
+    manager.launch(request, |group| self.prepare(group, &namespace, ...))
+}
 
-    let batch = loop {
-        match self.registry.acquire_batch(
-            namespace.system_domain(),
-            plan.system_keys(),
-        ) {
-            AcquireBatchOutcome::Acquired(batch) => break batch,
-            AcquireBatchOutcome::Pending(wait) => wait.wait(),
-        }
-    };
+fn prepare(&self, group: &ThreadGroup, namespace: &ApplicationNamespace, ...) {
+    let plan = NamespaceLoadPlanner::new(
+        namespace,
+        self.loader.catalog(),
+        SessionLimits::DEFAULT,
+    ).plan()?;
 
-    validate_batch_identities(&plan, &batch)?;
-
-    let root = plan.open_root()?;
-    let resolver = NamespaceArtifactResolver::new(plan, batch);
-    self.link_with(root, namespace.profile(), group, resolver)
+    // ApplicationLoader 内构造 NamespaceArtifactResolver；其构造函数先
+    // acquire_batch/wait，再把 root 和依赖交给 DynamicLinker。
+    self.loader.link(plan, namespace.profile(), group)?
 }
 ```
 
@@ -564,7 +569,7 @@ kernel/src/application/adapters/package_resolver.rs
 ```text
 kernel/src/application/namespace.rs
 kernel/src/application/planner.rs
-kernel/src/application/adapters/namespace_resolver.rs
+kernel/src/application/adapters/resolver.rs
 ```
 
 `registry.rs` 保留 batch acquire，key 从 SONAME 改为 system catalog path。若迁移后逐 SONAME 的 `AcquireOutcome/WaitHandle/acquire_or_begin_load()` 没有调用者，直接删除。
@@ -683,4 +688,3 @@ scripts/check_blueos_app_package.py
 7. 并发系统库加载不产生 ABBA 或 check timeout；
 8. strict package runtime 代码和无调用者生成脚本已删除；
 9. `check_all` 和相关 QEMU 动态加载测试通过。
-
