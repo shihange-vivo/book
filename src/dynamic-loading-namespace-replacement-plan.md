@@ -302,10 +302,12 @@ pub struct SystemLibraryEntry {
     lookup_name: &'static [u8],
     /// 系统库的规范化绝对路径，同时作为 registry key。
     path: &'static str,
-    build_id: Option<&'static [u8]>,
     keep_cached: bool,
 }
 ```
+
+当前实现按规范化路径构造 artifact identity，不在运行时解析或校验 GNU
+build-id；构建期 ELF 检查仍可要求产物携带 build-id，供离线诊断使用。
 
 `SystemLibraryPaths` 提供两种查询：
 
